@@ -1,0 +1,21 @@
+[package]
+name = "rd_genesis"
+description = "Genesis v2 instructions for the Iroha 2 track (platforms/iroha2/docs/spec-g2-g5.md)"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+[[bin]]
+name = "rd-genesis"
+path = "src/main.rs"
+
+[dependencies]
+iroha_core.workspace = true
+iroha_crypto.workspace = true
+iroha_data_model.workspace = true
+iroha_genesis.workspace = true
+iroha_primitives.workspace = true
+norito.workspace = true
+hex = { workspace = true, features = ["alloc"] }
+serde_json = "1.0"
+x25519-dalek = { version = "2.0.1", default-features = false }

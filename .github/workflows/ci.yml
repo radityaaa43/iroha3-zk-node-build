@@ -1,0 +1,76 @@
+# Tests of the fork patches and our crates on a GitHub-hosted runner (public repo: 4 vCPU / 16 GB).
+# Every push and PR. Also checks that image/Cargo.lock matches the workspace; on a mismatch it uploads the
+# corrected lockfile as an artifact (cargo update --workspace changes only our own crates' entries).
+name: ci
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: iroha_core test filters, space-separated (default = our fork modules)
+        default: "rd_p1:: rd_disclosure:: rd_dvp::"
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: 2
+  NORITO_SKIP_BINDINGS_SYNC: 1
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with: {persist-credentials: false}
+      - name: Free disk and add swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost \
+            /usr/share/swift /usr/local/.ghcup /usr/local/share/powershell
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile.ci && sudo chmod 600 /swapfile.ci && sudo mkswap /swapfile.ci && sudo swapon /swapfile.ci || echo "::warning::no swap"
+          nproc; free -g; df -h /
+      - name: Prepare source
+        run: ci/prepare-src.sh "$RUNNER_TEMP/iroha"
+      - name: Cache cargo
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/iroha/target
+          key: cargo-${{ hashFiles('image/Cargo.lock', 'fork/patches/**', 'driver/**', 'tools/**') }}
+          restore-keys: cargo-
+      - name: Lockfile in sync
+        working-directory: ${{ runner.temp }}/iroha
+        run: |
+          cp Cargo.lock Cargo.lock.committed
+          cargo update --workspace --quiet
+          if ! cmp -s Cargo.lock Cargo.lock.committed; then
+            diff -u Cargo.lock.committed Cargo.lock | head -80 || true
+            cp Cargo.lock "$RUNNER_TEMP/Cargo.lock"
+            echo "LOCK_DRIFT=1" >> "$GITHUB_ENV"
+          fi
+      - if: env.LOCK_DRIFT == '1'
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with: {name: Cargo.lock, path: "${{ runner.temp }}/Cargo.lock"}
+      - if: env.LOCK_DRIFT == '1'
+        run: |
+          echo "image/Cargo.lock is out of date: take the Cargo.lock artifact" >&2
+          exit 1
+      - name: rd_driver and rd_genesis tests
+        working-directory: ${{ runner.temp }}/iroha
+        run: cargo test --release --locked -p rd_driver -p rd_genesis
+      - name: iroha_core fork tests
+        working-directory: ${{ runner.temp }}/iroha
+        # Module paths, not a bare "rd_": that substring also matches upstream tests (e.g. "hard_stale").
+        env:
+          FILTERS: "${{ inputs.filter || 'rd_p1:: rd_disclosure:: rd_dvp::' }}"
+        run: |
+          # shellcheck disable=SC2086  # FILTERS is a space-separated list of test filters
+          cargo test --release --locked -p iroha_core --lib -- $FILTERS
+      - name: shellcheck
+        run: shellcheck -S warning image/build.sh ci/*.sh

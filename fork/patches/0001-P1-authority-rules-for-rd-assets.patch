@@ -1,0 +1,837 @@
+From c22655ddb20b457fd458b3e883218c8a3c36552d Mon Sep 17 00:00:00 2001
+From: rd-fork <rd-fork@localhost>
+Date: Tue, 24 Nov 2026 15:27:24 +0800
+Subject: [PATCH 1/2] 0001 P1 authority rules for rd assets
+
+In the Initial executor, when a domain named rd exists and outside the genesis
+block: mint/burn by asset definition owner, shield by the debited account,
+transparent transfer by the source account only, RegisterZkAsset by the owner
+with a locked vk_transfer, metadata writes by owner (accounts: the account
+itself), SetParameter/Upgrade need CanSetParameters/CanUpgradeExecutor,
+rd_eligible on mint/transfer/shield. R9 (added): grant/revoke, unregister of rd
+things and confidential policy transitions only by the owner. The detached
+parallel path falls back to sequential in rd mode.
+---
+ crates/iroha_core/src/block.rs    |   9 +
+ crates/iroha_core/src/executor.rs |   5 +
+ crates/iroha_core/src/lib.rs      |   1 +
+ crates/iroha_core/src/rd_p1.rs    | 759 ++++++++++++++++++++++++++++++
+ 4 files changed, 774 insertions(+)
+ create mode 100644 crates/iroha_core/src/rd_p1.rs
+
+diff --git a/crates/iroha_core/src/block.rs b/crates/iroha_core/src/block.rs
+index 219694db..4948df87 100644
+--- a/crates/iroha_core/src/block.rs
++++ b/crates/iroha_core/src/block.rs
+@@ -8672,6 +8672,15 @@ pub(crate) mod valid {
+                             if requires_fee_postprocessing(tx) {
+                                 return (p.idx, None);
+                             }
++                            // RD fork patch P1: the detached path has no authority checks for
++                            // Mint/Burn/SetKeyValue/SetParameter/Grant; use the sequential path.
++                            if state_block
++                                .world
++                                .domains_iter()
++                                .any(|d| d.id.name().to_string() == crate::rd_p1::RD_DOMAIN)
++                            {
++                                return (p.idx, None);
++                            }
+                             if ovl.has_durable_state_changes() {
+                                 return (p.idx, None);
+                             }
+diff --git a/crates/iroha_core/src/executor.rs b/crates/iroha_core/src/executor.rs
+index d0cc1ad9..f1a264a5 100644
+--- a/crates/iroha_core/src/executor.rs
++++ b/crates/iroha_core/src/executor.rs
+@@ -2977,6 +2977,11 @@ impl Executor {
+         let is_genesis =
+             state_transaction._curr_block.is_genesis() && state_transaction.block_hashes.is_empty();
+ 
++        // RD fork patch P1: authority rules (only active when domain `rd` exists, never in genesis).
++        if !is_genesis {
++            crate::rd_p1::check(state_transaction, authority, &instruction)?;
++        }
++
+         if let Some(register_role) = extract_register_role(&instruction) {
+             if let Some(multisig_account) =
+                 Self::multisig_account_from(register_role.object().id())?
+diff --git a/crates/iroha_core/src/lib.rs b/crates/iroha_core/src/lib.rs
+index 68155cc1..4957ac8c 100644
+--- a/crates/iroha_core/src/lib.rs
++++ b/crates/iroha_core/src/lib.rs
+@@ -83,6 +83,7 @@ pub mod compliance;
+ pub mod da;
+ /// Runtime executor integration and helpers.
+ pub mod executor;
++pub mod rd_p1;
+ /// FASTPQ transcript helpers and host plumbing.
+ pub mod fastpq;
+ /// Unified settlement fee evidence structures.
+diff --git a/crates/iroha_core/src/rd_p1.rs b/crates/iroha_core/src/rd_p1.rs
+new file mode 100644
+index 00000000..cf439cd5
+--- /dev/null
++++ b/crates/iroha_core/src/rd_p1.rs
+@@ -0,0 +1,759 @@
++//! RD fork patch P1: authority rules for assets and governance in the `rd` domain.
++//!
++//! Active only when a domain named `rd` exists in the world ("rd mode"), and never in the genesis
++//! block. Called from the `Initial` executor (`executor.rs::execute_initial_instruction`) before the
++//! stock checks, so it can only tighten them. Spec: `platforms/iroha2/docs/spec-g2-g5.md` section 4.
++//! Rules 1-8 are the spec; R9 (grant/revoke, unregister, policy transitions) is added because without
++//! it rules 5 and 7 can be bypassed (the stock executor lets any account grant itself any permission).
++//! Every error starts with `rd-authority:`.
++
++use core::any::type_name;
++
++use iroha_data_model::{
++    ValidationFail,
++    account::{Account, AccountId},
++    asset::{
++        AssetDefinition,
++        id::AssetDefinitionId,
++        value::Asset,
++    },
++    isi::{
++        GrantBox, InstructionBox, RemoveKeyValueBox, RevokeBox, SetKeyValueBox, TransferBox,
++        mint_burn::{BurnBox, MintBox},
++        register::UnregisterBox,
++        zk::{
++            CancelConfidentialPolicyTransition, RegisterZkAsset,
++            ScheduleConfidentialPolicyTransition, Shield,
++        },
++        Burn, Grant, Mint, RemoveKeyValue, Revoke, SetKeyValue, SetParameter, Transfer, Unregister,
++        Upgrade,
++    },
++    permission::Permission,
++    prelude::{Domain, DomainId},
++    role::{Role, RoleId},
++};
++use iroha_primitives::numeric::Numeric;
++use mv::storage::StorageReadOnly;
++use norito::codec::Decode;
++
++use crate::state::{StateTransaction, WorldReadOnly};
++
++/// Domain name that switches the rules on.
++pub const RD_DOMAIN: &str = "rd";
++/// Metadata key on an asset definition: JSON array of account ids (`AccountId::to_string()`).
++pub const KEY_ELIGIBLE: &str = "rd_eligible";
++
++fn denied(msg: impl core::fmt::Display) -> ValidationFail {
++    ValidationFail::NotPermitted(format!("rd-authority: {msg}"))
++}
++
++fn is_rd_domain(id: &DomainId) -> bool {
++    id.name().to_string() == RD_DOMAIN
++}
++
++fn in_rd(def: &AssetDefinitionId) -> bool {
++    def.try_domain().is_some_and(is_rd_domain)
++}
++
++/// Owner of the `rd` domain, `None` when the chain has no such domain (rules off).
++fn rd_owner(world: &impl WorldReadOnly) -> Option<AccountId> {
++    world
++        .domains_iter()
++        .find(|d| is_rd_domain(&d.id))
++        .map(|d| d.owned_by().clone())
++}
++
++/// Concrete instruction `T`, from a downcast or (as the stock extractors do) a decode of its bytes.
++fn extract<T: 'static + Clone + Decode>(i: &InstructionBox) -> Option<T> {
++    if let Some(v) = i.as_any().downcast_ref::<T>() {
++        return Some(v.clone());
++    }
++    if i.id() != type_name::<T>() {
++        return None;
++    }
++    let bytes = i.dyn_encode();
++    std::panic::catch_unwind(|| {
++        let mut s = &bytes[..];
++        T::decode(&mut s).ok()
++    })
++    .ok()
++    .flatten()
++}
++
++fn is_type<T: 'static>(i: &InstructionBox) -> bool {
++    i.as_any().is::<T>() || i.id() == type_name::<T>()
++}
++
++fn mint_asset(i: &InstructionBox) -> Option<Mint<Numeric, Asset>> {
++    match i.as_any().downcast_ref::<MintBox>() {
++        Some(MintBox::Asset(m)) => Some(m.clone()),
++        Some(_) => None,
++        None => extract(i),
++    }
++}
++
++fn burn_asset(i: &InstructionBox) -> Option<Burn<Numeric, Asset>> {
++    match i.as_any().downcast_ref::<BurnBox>() {
++        Some(BurnBox::Asset(b)) => Some(b.clone()),
++        Some(_) => None,
++        None => extract(i),
++    }
++}
++
++fn transfer_asset(i: &InstructionBox) -> Option<Transfer<Asset, Numeric, Account>> {
++    match i.as_any().downcast_ref::<TransferBox>() {
++        Some(TransferBox::Asset(t)) => Some(t.clone()),
++        Some(_) => None,
++        None => extract(i),
++    }
++}
++
++enum KvTarget {
++    AssetDefinition(AssetDefinitionId),
++    Domain(DomainId),
++    Account(AccountId),
++}
++
++/// Target of a `SetKeyValue` / `RemoveKeyValue` on an asset definition, domain or account.
++fn kv_target(i: &InstructionBox) -> Option<KvTarget> {
++    let any = i.as_any();
++    if let Some(set) = any.downcast_ref::<SetKeyValueBox>() {
++        return match set {
++            SetKeyValueBox::AssetDefinition(s) => Some(KvTarget::AssetDefinition(s.object.clone())),
++            SetKeyValueBox::Domain(s) => Some(KvTarget::Domain(s.object.clone())),
++            SetKeyValueBox::Account(s) => Some(KvTarget::Account(s.object.clone())),
++            _ => None,
++        };
++    }
++    if let Some(rm) = any.downcast_ref::<RemoveKeyValueBox>() {
++        return match rm {
++            RemoveKeyValueBox::AssetDefinition(r) => {
++                Some(KvTarget::AssetDefinition(r.object.clone()))
++            }
++            RemoveKeyValueBox::Domain(r) => Some(KvTarget::Domain(r.object.clone())),
++            RemoveKeyValueBox::Account(r) => Some(KvTarget::Account(r.object.clone())),
++            _ => None,
++        };
++    }
++    extract::<SetKeyValue<AssetDefinition>>(i)
++        .map(|s| KvTarget::AssetDefinition(s.object))
++        .or_else(|| extract::<RemoveKeyValue<AssetDefinition>>(i).map(|r| KvTarget::AssetDefinition(r.object)))
++        .or_else(|| extract::<SetKeyValue<Domain>>(i).map(|s| KvTarget::Domain(s.object)))
++        .or_else(|| extract::<RemoveKeyValue<Domain>>(i).map(|r| KvTarget::Domain(r.object)))
++        .or_else(|| extract::<SetKeyValue<Account>>(i).map(|s| KvTarget::Account(s.object)))
++        .or_else(|| extract::<RemoveKeyValue<Account>>(i).map(|r| KvTarget::Account(r.object)))
++}
++
++fn unregister_target(i: &InstructionBox) -> Option<KvTarget> {
++    match i.as_any().downcast_ref::<UnregisterBox>() {
++        Some(UnregisterBox::AssetDefinition(u)) => {
++            Some(KvTarget::AssetDefinition(u.object.clone()))
++        }
++        Some(UnregisterBox::Domain(u)) => Some(KvTarget::Domain(u.object.clone())),
++        Some(_) => None,
++        None => extract::<Unregister<AssetDefinition>>(i)
++            .map(|u| KvTarget::AssetDefinition(u.object))
++            .or_else(|| extract::<Unregister<Domain>>(i).map(|u| KvTarget::Domain(u.object))),
++    }
++}
++
++fn is_grant_or_revoke(i: &InstructionBox) -> bool {
++    i.as_any().is::<GrantBox>()
++        || i.as_any().is::<RevokeBox>()
++        || is_type::<Grant<Permission, Account>>(i)
++        || is_type::<Grant<RoleId, Account>>(i)
++        || is_type::<Grant<Permission, Role>>(i)
++        || is_type::<Revoke<Permission, Account>>(i)
++        || is_type::<Revoke<RoleId, Account>>(i)
++        || is_type::<Revoke<Permission, Role>>(i)
++}
++
++fn def_owner(world: &impl WorldReadOnly, def: &AssetDefinitionId) -> Option<AccountId> {
++    world.asset_definition(def).ok().map(|d| d.owned_by().clone())
++}
++
++/// `authority` must own the asset definition `def` (an unknown definition is left to the stock error).
++fn require_def_owner(
++    world: &impl WorldReadOnly,
++    authority: &AccountId,
++    def: &AssetDefinitionId,
++    what: &str,
++) -> Result<(), ValidationFail> {
++    match def_owner(world, def) {
++        Some(owner) if &owner == authority => Ok(()),
++        Some(_) => Err(denied(format!("{what} of {def} requires the asset definition owner"))),
++        None => Ok(()),
++    }
++}
++
++/// Rule 8: if the definition has `rd_eligible`, `account` must be listed.
++fn require_eligible(
++    world: &impl WorldReadOnly,
++    def: &AssetDefinitionId,
++    account: &AccountId,
++) -> Result<(), ValidationFail> {
++    let Ok(definition) = world.asset_definition(def) else {
++        return Ok(());
++    };
++    let Some(json) = definition.metadata.get(KEY_ELIGIBLE) else {
++        return Ok(());
++    };
++    let list: Vec<String> = json
++        .try_into_any()
++        .map_err(|_| denied(format!("{KEY_ELIGIBLE} of {def} is not a JSON array of strings")))?;
++    if list.iter().any(|a| a == &account.to_string()) {
++        Ok(())
++    } else {
++        Err(denied(format!("{account} is not in {KEY_ELIGIBLE} of {def}")))
++    }
++}
++
++/// Permission held by name (direct or through a role); payload ignored.
++fn has_named_permission(world: &impl WorldReadOnly, who: &AccountId, name: &str) -> bool {
++    if world
++        .account_permissions_iter(who)
++        .is_ok_and(|mut perms| perms.any(|p| p.name() == name))
++    {
++        return true;
++    }
++    world.account_roles_iter(who).any(|role_id| {
++        world
++            .roles()
++            .get(role_id)
++            .is_some_and(|role| role.permissions.iter().any(|p| p.name() == name))
++    })
++}
++
++/// Enforce P1 for one instruction. `Ok(())` when rd mode is off or the instruction is outside P1.
++pub(crate) fn check(
++    st: &StateTransaction<'_, '_>,
++    authority: &AccountId,
++    i: &InstructionBox,
++) -> Result<(), ValidationFail> {
++    let w = &st.world;
++    let Some(rd_owner) = rd_owner(w) else {
++        return Ok(());
++    };
++
++    // Rule 1 (+8): mint = definition owner, destination eligible.
++    if let Some(m) = mint_asset(i) {
++        let def = m.destination.definition();
++        if in_rd(def) {
++            require_def_owner(w, authority, def, "mint")?;
++            require_eligible(w, def, m.destination.account())?;
++        }
++        return Ok(());
++    }
++    // Rule 1: burn = definition owner.
++    if let Some(b) = burn_asset(i) {
++        let def = b.destination.definition();
++        if in_rd(def) {
++            require_def_owner(w, authority, def, "burn")?;
++        }
++        return Ok(());
++    }
++    // Rule 2 (+8): shield = the account that is debited, and it must be eligible.
++    if let Some(s) = extract::<Shield>(i) {
++        if in_rd(&s.asset) {
++            if &s.from != authority {
++                return Err(denied("shield requires the debited account to sign"));
++            }
++            require_eligible(w, &s.asset, &s.from)?;
++        }
++        return Ok(());
++    }
++    // Rule 3 (+8): transparent transfer = source account only (no domain-owner override).
++    if let Some(t) = transfer_asset(i) {
++        let def = t.source.definition();
++        if in_rd(def) {
++            if t.source.account() != authority {
++                return Err(denied("transfer requires the source account to sign"));
++            }
++            require_eligible(w, def, &t.destination)?;
++        }
++        return Ok(());
++    }
++    // Rule 4: RegisterZkAsset = definition owner; a set vk_transfer cannot change or clear.
++    if let Some(r) = extract::<RegisterZkAsset>(i) {
++        if in_rd(&r.asset) {
++            require_def_owner(w, authority, &r.asset, "register zk asset")?;
++            if let Some(locked) = w.zk_assets.get(&r.asset).and_then(|s| s.vk_transfer.clone()) {
++                let same = r.vk_transfer.as_ref().is_some_and(|id| {
++                    id == &locked.id
++                        && w.verifying_keys
++                            .get(id)
++                            .is_some_and(|rec| rec.commitment == locked.commitment)
++                });
++                if !same {
++                    return Err(denied("vk_transfer is bound and cannot be changed or cleared"));
++                }
++            }
++        }
++        return Ok(());
++    }
++    // Rule 5 is enforced by RegisterVerifyingKey / UpdateVerifyingKey themselves
++    // (CanManageVerifyingKeys, world.rs); R9 below stops anyone else from granting it.
++
++    // Rule 6: metadata writes.
++    if let Some(target) = kv_target(i) {
++        match target {
++            KvTarget::AssetDefinition(def) if in_rd(&def) => {
++                require_def_owner(w, authority, &def, "metadata write")?;
++            }
++            KvTarget::Domain(d) if is_rd_domain(&d) => {
++                let owner = w.domain(&d).map(|dom| dom.owned_by().clone()).ok();
++                if owner.is_some_and(|o| &o != authority) {
++                    return Err(denied("rd domain metadata requires the domain owner"));
++                }
++            }
++            // The account itself only; this also covers `rd_*` keys of the rd owner (bi).
++            KvTarget::Account(acc) if &acc != authority => {
++                return Err(denied("account metadata requires the account itself"));
++            }
++            _ => {}
++        }
++        return Ok(());
++    }
++    // Rule 7: SetParameter / Upgrade need a permission that only the rd owner is granted.
++    if is_type::<SetParameter>(i) && !has_named_permission(w, authority, "CanSetParameters") {
++        return Err(denied("SetParameter requires CanSetParameters"));
++    }
++    if is_type::<Upgrade>(i) && !has_named_permission(w, authority, "CanUpgradeExecutor") {
++        return Err(denied("Upgrade requires CanUpgradeExecutor"));
++    }
++    // R9: grants and revokes only by the rd owner, else rules 5 and 7 are bypassable.
++    if is_grant_or_revoke(i) && authority != &rd_owner {
++        return Err(denied("grant/revoke requires the rd domain owner"));
++    }
++    // R9: nobody but the owner unregisters rd things or schedules policy transitions on them.
++    if let Some(target) = unregister_target(i) {
++        match target {
++            KvTarget::AssetDefinition(def) if in_rd(&def) => {
++                require_def_owner(w, authority, &def, "unregister")?;
++            }
++            KvTarget::Domain(d) if is_rd_domain(&d) && authority != &rd_owner => {
++                return Err(denied("unregister of the rd domain requires its owner"));
++            }
++            _ => {}
++        }
++    }
++    let policy_asset = extract::<ScheduleConfidentialPolicyTransition>(i)
++        .map(|s| s.asset)
++        .or_else(|| extract::<CancelConfidentialPolicyTransition>(i).map(|c| c.asset));
++    if let Some(def) = policy_asset {
++        if in_rd(&def) {
++            require_def_owner(w, authority, &def, "policy transition")?;
++        }
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use iroha_crypto::KeyPair;
++    use iroha_data_model::{
++        Registrable as _,
++        asset::id::AssetId,
++        block::BlockHeader,
++        confidential::{ConfidentialEncryptedPayload, ConfidentialStatus},
++        isi::{
++            Grant, Mint, Revoke, SetParameter, Transfer,
++            verifying_keys::{RegisterVerifyingKey, UpdateVerifyingKey},
++            zk::{RegisterZkAsset, ZkAssetMode},
++        },
++        parameter::{Parameter, system::TransactionParameter},
++        prelude::{Register, Domain},
++        proof::{VerifyingKeyBox, VerifyingKeyId, VerifyingKeyRecord},
++        zk::BackendTag,
++    };
++    use iroha_primitives::json::Json;
++    use nonzero_ext::nonzero;
++
++    use super::*;
++    use crate::{
++        executor::Executor,
++        kura::Kura,
++        query::store::LiveQueryStore,
++        smartcontracts::Execute as _,
++        state::{State, World},
++    };
++
++    struct Ids {
++        bi: AccountId,
++        a: AccountId,
++        b: AccountId,
++        rd: AssetDefinitionId,
++        bond: AssetDefinitionId,
++        coin: AssetDefinitionId, // outside the rd domain
++        mine: AssetDefinitionId, // in rd, but owned by a, not by the rd domain owner
++    }
++
++    fn dummy_executor() -> iroha_data_model::executor::Executor {
++        iroha_data_model::executor::Executor::new(
++            iroha_data_model::transaction::executable::IvmBytecode::from_compiled(vec![1, 2, 3]),
++        )
++    }
++
++    fn acct() -> AccountId {
++        AccountId::new(KeyPair::random().into_parts().0)
++    }
++
++    fn name(s: &str) -> iroha_data_model::name::Name {
++        s.parse().unwrap()
++    }
++
++    /// World with domain `rd` owned by bi (assets `rd`, `dfabi`) and domain `users` (asset `coin`).
++    /// `genesis`: run inside the genesis block instead of block 2.
++    fn run(genesis: bool, f: impl FnOnce(&mut StateTransaction<'_, '_>, &Ids)) {
++        let ids = Ids {
++            bi: acct(),
++            a: acct(),
++            b: acct(),
++            rd: AssetDefinitionId::new(DomainId::try_new("rd", "universal").unwrap(), name("rd")),
++            bond: AssetDefinitionId::new(
++                DomainId::try_new("rd", "universal").unwrap(),
++                name("dfabi"),
++            ),
++            coin: AssetDefinitionId::new(
++                DomainId::try_new("users", "universal").unwrap(),
++                name("coin"),
++            ),
++            mine: AssetDefinitionId::new(
++                DomainId::try_new("rd", "universal").unwrap(),
++                name("mine"),
++            ),
++        };
++        let def = |id: &AssetDefinitionId, owner: &AccountId| {
++            AssetDefinition::numeric(id.clone())
++                .with_name(id.name().to_string())
++                .build(owner)
++        };
++        let world = World::with_assets(
++            [
++                Domain::new(DomainId::try_new("rd", "universal").unwrap()).build(&ids.bi),
++                Domain::new(DomainId::try_new("users", "universal").unwrap()).build(&ids.bi),
++            ],
++            [&ids.bi, &ids.a, &ids.b].map(|id| Account::new(id.clone()).build(id)),
++            [
++                def(&ids.rd, &ids.bi),
++                def(&ids.bond, &ids.bi),
++                def(&ids.coin, &ids.bi),
++                def(&ids.mine, &ids.a),
++            ],
++            [],
++            [],
++        );
++        let state = State::new(world, Kura::blank_kura_for_testing(), LiveQueryStore::start_test());
++        let mut height = nonzero!(1_u64);
++        if !genesis {
++            state
++                .block(BlockHeader::new(height, None, None, None, 0, 0))
++                .commit()
++                .expect("commit bootstrap block");
++            height = nonzero!(2_u64);
++        }
++        let mut block = state.block(BlockHeader::new(height, None, None, None, 0, 0));
++        let mut stx = block.transaction();
++        assert_eq!(genesis, stx._curr_block.is_genesis() && stx.block_hashes.is_empty());
++        f(&mut stx, &ids);
++    }
++
++    fn exec(
++        stx: &mut StateTransaction<'_, '_>,
++        who: &AccountId,
++        isi: impl Into<InstructionBox>,
++    ) -> Result<(), ValidationFail> {
++        Executor::Initial.execute_instruction(stx, who, isi.into())
++    }
++
++    fn is_p1(res: &Result<(), ValidationFail>) -> bool {
++        matches!(res, Err(ValidationFail::NotPermitted(m)) if m.starts_with("rd-authority:"))
++    }
++
++    fn ok(res: Result<(), ValidationFail>) {
++        assert!(res.is_ok(), "expected Ok, got {res:?}");
++    }
++
++    fn denied_p1(res: Result<(), ValidationFail>) {
++        assert!(is_p1(&res), "expected rd-authority denial, got {res:?}");
++    }
++
++    fn mint(def: &AssetDefinitionId, to: &AccountId, n: u32) -> Mint<Numeric, Asset> {
++        Mint::asset_numeric(n, AssetId::new(def.clone(), to.clone()))
++    }
++
++    fn perm(name: &str) -> Permission {
++        Permission::new(name.parse().unwrap(), Json::new(()))
++    }
++
++    fn set_eligible(stx: &mut StateTransaction<'_, '_>, ids: &Ids, who: &[&AccountId]) {
++        let list: Vec<String> = who.iter().map(|a| a.to_string()).collect();
++        ok(exec(
++            stx,
++            &ids.bi,
++            SetKeyValue::asset_definition(ids.bond.clone(), name(KEY_ELIGIBLE), Json::new(list)),
++        ));
++    }
++
++    // Rule 1
++    #[test]
++    fn r1_mint_by_definition_owner_ok() {
++        run(false, |stx, ids| ok(exec(stx, &ids.bi, mint(&ids.rd, &ids.a, 10))));
++    }
++
++    #[test]
++    fn r1_mint_by_other_denied() {
++        run(false, |stx, ids| {
++            denied_p1(exec(stx, &ids.a, mint(&ids.rd, &ids.a, 10)));
++            // only the definition owner counts, not the rd domain owner
++            denied_p1(exec(stx, &ids.bi, mint(&ids.mine, &ids.a, 10)));
++            ok(exec(stx, &ids.a, mint(&ids.mine, &ids.a, 10)));
++        });
++    }
++
++    #[test]
++    fn r1_burn_by_owner_ok_by_holder_denied() {
++        run(false, |stx, ids| {
++            ok(exec(stx, &ids.bi, mint(&ids.rd, &ids.a, 10)));
++            let burn = |n| Burn::asset_numeric(n, AssetId::new(ids.rd.clone(), ids.a.clone()));
++            denied_p1(exec(stx, &ids.a, burn(1_u32)));
++            ok(exec(stx, &ids.bi, burn(1_u32)));
++        });
++    }
++
++    #[test]
++    fn non_rd_assets_unchanged() {
++        run(false, |stx, ids| {
++            // stock behaviour: no authority check on Mint outside rd
++            ok(exec(stx, &ids.a, mint(&ids.coin, &ids.a, 10)));
++        });
++    }
++
++    #[test]
++    fn genesis_signer_is_not_restricted() {
++        run(true, |stx, ids| {
++            let res = exec(stx, &ids.a, mint(&ids.rd, &ids.a, 10));
++            assert!(!is_p1(&res), "{res:?}");
++            let res = exec(stx, &ids.a, Grant::account_permission(perm("CanSetParameters"), ids.a.clone()));
++            assert!(!is_p1(&res), "{res:?}");
++        });
++    }
++
++    fn register_zk(stx: &mut StateTransaction<'_, '_>, who: &AccountId, def: &AssetDefinitionId,
++        vk_transfer: Option<VerifyingKeyId>) -> Result<(), ValidationFail> {
++        exec(stx, who, RegisterZkAsset::new(def.clone(), ZkAssetMode::Hybrid, true, true, vk_transfer, None, None))
++    }
++
++    fn shield(ids: &Ids, def: &AssetDefinitionId, from: &AccountId) -> Shield {
++        Shield::new(def.clone(), from.clone(), 5, [7u8; 32], ConfidentialEncryptedPayload::default())
++    }
++
++    // Rule 2
++    #[test]
++    fn r2_shield_requires_debited_account() {
++        run(false, |stx, ids| {
++            ok(register_zk(stx, &ids.bi, &ids.rd, None));
++            ok(exec(stx, &ids.bi, mint(&ids.rd, &ids.a, 10)));
++            denied_p1(exec(stx, &ids.b, shield(ids, &ids.rd, &ids.a)));
++            denied_p1(exec(stx, &ids.bi, shield(ids, &ids.rd, &ids.a)));
++            ok(exec(stx, &ids.a, shield(ids, &ids.rd, &ids.a)));
++        });
++    }
++
++    // Rule 3
++    #[test]
++    fn r3_transfer_only_by_source() {
++        run(false, |stx, ids| {
++            ok(exec(stx, &ids.bi, mint(&ids.rd, &ids.a, 10)));
++            let tr = |n| {
++                Transfer::asset_numeric(AssetId::new(ids.rd.clone(), ids.a.clone()), n, ids.b.clone())
++            };
++            denied_p1(exec(stx, &ids.bi, tr(1_u32))); // domain owner override is gone
++            denied_p1(exec(stx, &ids.b, tr(1_u32)));
++            ok(exec(stx, &ids.a, tr(1_u32)));
++        });
++    }
++
++    // Rule 4
++    #[test]
++    fn r4_register_zk_asset_owner_only() {
++        run(false, |stx, ids| {
++            denied_p1(register_zk(stx, &ids.a, &ids.rd, None));
++            ok(register_zk(stx, &ids.bi, &ids.rd, None));
++        });
++    }
++
++    fn vk_record(version: u32, bytes: Vec<u8>) -> (VerifyingKeyBox, VerifyingKeyRecord) {
++        let circuit = format!("vk{}", bytes[0]);
++        let vk = VerifyingKeyBox::new("halo2/ipa".into(), bytes.clone());
++        let mut rec = VerifyingKeyRecord::new(
++            version,
++            circuit,
++            BackendTag::Halo2IpaPasta,
++            "pallas",
++            [0x5A; 32],
++            crate::zk::hash_vk(&vk),
++        );
++        rec.vk_len = u32::try_from(bytes.len()).unwrap();
++        rec.key = Some(vk.clone());
++        rec.status = ConfidentialStatus::Active;
++        rec.gas_schedule_id = Some("halo2_default".into());
++        (vk, rec)
++    }
++
++    #[test]
++    fn r4_vk_transfer_cannot_change_or_clear() {
++        run(false, |stx, ids| {
++            Grant::account_permission(perm("CanManageVerifyingKeys"), ids.bi.clone())
++                .execute(&ids.bi, stx)
++                .unwrap();
++            let id_a = VerifyingKeyId::new("halo2/ipa", "vk_a");
++            let id_b = VerifyingKeyId::new("halo2/ipa", "vk_b");
++            for (id, bytes) in [(&id_a, vec![1, 2, 3]), (&id_b, vec![4, 5, 6])] {
++                ok(exec(stx, &ids.bi, RegisterVerifyingKey { id: id.clone(), record: vk_record(1, bytes).1 }));
++            }
++            ok(register_zk(stx, &ids.bi, &ids.rd, Some(id_a.clone())));
++            denied_p1(register_zk(stx, &ids.bi, &ids.rd, None)); // clear
++            denied_p1(register_zk(stx, &ids.bi, &ids.rd, Some(id_b))); // change
++            // same key, same commitment: allowed
++            ok(register_zk(stx, &ids.bi, &ids.rd, Some(id_a.clone())));
++            // same id but the record was updated since binding: rebinding is refused
++            ok(exec(stx, &ids.bi, UpdateVerifyingKey { id: id_a.clone(), record: vk_record(2, vec![1, 9, 9]).1 }));
++            denied_p1(register_zk(stx, &ids.bi, &ids.rd, Some(id_a)));
++        });
++    }
++
++    // Rule 5
++    #[test]
++    fn r5_vk_management_needs_permission() {
++        run(false, |stx, ids| {
++            let id = VerifyingKeyId::new("halo2/ipa", "vk");
++            let reg = || RegisterVerifyingKey { id: id.clone(), record: vk_record(1, vec![1, 2, 3]).1 };
++            let res = exec(stx, &ids.a, reg());
++            assert!(res.is_err(), "no permission must fail: {res:?}");
++            // cannot self-grant (R9), only the rd owner grants
++            denied_p1(exec(stx, &ids.a, Grant::account_permission(perm("CanManageVerifyingKeys"), ids.a.clone())));
++            ok(exec(stx, &ids.bi, Grant::account_permission(perm("CanManageVerifyingKeys"), ids.bi.clone())));
++            ok(exec(stx, &ids.bi, reg()));
++            let res = exec(stx, &ids.a, UpdateVerifyingKey { id: id.clone(), record: vk_record(2, vec![1, 2, 3]).1 });
++            assert!(res.is_err(), "update without permission must fail: {res:?}");
++        });
++    }
++
++    // Rule 6
++    #[test]
++    fn r6_asset_definition_metadata_owner_only() {
++        run(false, |stx, ids| {
++            let set = |def: &AssetDefinitionId| SetKeyValue::asset_definition(def.clone(), name("k"), Json::new("v"));
++            denied_p1(exec(stx, &ids.a, set(&ids.rd)));
++            denied_p1(exec(stx, &ids.a, RemoveKeyValue::asset_definition(ids.rd.clone(), name("k"))));
++            ok(exec(stx, &ids.bi, set(&ids.rd)));
++            ok(exec(stx, &ids.bi, RemoveKeyValue::asset_definition(ids.rd.clone(), name("k"))));
++            ok(exec(stx, &ids.a, set(&ids.coin))); // outside rd: stock behaviour
++        });
++    }
++
++    #[test]
++    fn r6_domain_metadata_owner_only() {
++        run(false, |stx, ids| {
++            let rd = DomainId::try_new("rd", "universal").unwrap();
++            let set = || SetKeyValue::domain(rd.clone(), name("k"), Json::new("v"));
++            denied_p1(exec(stx, &ids.a, set()));
++            denied_p1(exec(stx, &ids.a, RemoveKeyValue::domain(rd.clone(), name("k"))));
++            ok(exec(stx, &ids.bi, set()));
++        });
++    }
++
++    #[test]
++    fn r6_account_metadata_account_itself_only() {
++        run(false, |stx, ids| {
++            let set = |acc: &AccountId, k: &str| SetKeyValue::account(acc.clone(), name(k), Json::new("v"));
++            ok(exec(stx, &ids.a, set(&ids.a, "mine")));
++            denied_p1(exec(stx, &ids.a, set(&ids.bi, "rd_audit_keys")));
++            denied_p1(exec(stx, &ids.bi, set(&ids.a, "x"))); // not even bi, it is a's account
++            ok(exec(stx, &ids.bi, set(&ids.bi, "rd_audit_keys")));
++            // a holder of CanModifyAccountMetadata for bi is still refused
++            let p: Permission =
++                iroha_executor_data_model::permission::account::CanModifyAccountMetadata { account: ids.bi.clone() }
++                    .into();
++            Grant::account_permission(p, ids.a.clone()).execute(&ids.bi, stx).unwrap();
++            denied_p1(exec(stx, &ids.a, set(&ids.bi, "rd_audit_keys")));
++        });
++    }
++
++    // Rule 7
++    #[test]
++    fn r7_set_parameter_and_upgrade_need_permission() {
++        run(false, |stx, ids| {
++            let sp = || SetParameter::new(Parameter::Transaction(TransactionParameter::RequireHeightTtl(true)));
++            denied_p1(exec(stx, &ids.a, sp()));
++            denied_p1(exec(stx, &ids.bi, sp())); // owner without the permission is refused too
++            denied_p1(exec(
++                stx,
++                &ids.a,
++                Upgrade::new(dummy_executor()),
++            ));
++            ok(exec(stx, &ids.bi, Grant::account_permission(perm("CanSetParameters"), ids.bi.clone())));
++            ok(exec(stx, &ids.bi, sp()));
++            denied_p1(exec(stx, &ids.a, sp()));
++            ok(exec(stx, &ids.bi, Grant::account_permission(perm("CanUpgradeExecutor"), ids.bi.clone())));
++            let res = exec(stx, &ids.bi, Upgrade::new(dummy_executor()));
++            assert!(!is_p1(&res), "{res:?}");
++        });
++    }
++
++    // Rule 8
++    #[test]
++    fn r8_eligibility_on_mint_transfer_shield() {
++        run(false, |stx, ids| {
++            ok(register_zk(stx, &ids.bi, &ids.bond, None));
++            set_eligible(stx, ids, &[&ids.bi, &ids.a]);
++            denied_p1(exec(stx, &ids.bi, mint(&ids.bond, &ids.b, 10)));
++            ok(exec(stx, &ids.bi, mint(&ids.bond, &ids.a, 10)));
++            let tr = |to: &AccountId| {
++                Transfer::asset_numeric(AssetId::new(ids.bond.clone(), ids.a.clone()), 1_u32, to.clone())
++            };
++            denied_p1(exec(stx, &ids.a, tr(&ids.b)));
++            ok(exec(stx, &ids.a, tr(&ids.bi)));
++            // b is not listed: cannot shield even its own balance (it has none; the check comes first)
++            denied_p1(exec(stx, &ids.b, shield(ids, &ids.bond, &ids.b)));
++            ok(exec(stx, &ids.a, shield(ids, &ids.bond, &ids.a)));
++            // an asset without rd_eligible is unrestricted
++            ok(exec(stx, &ids.bi, mint(&ids.rd, &ids.b, 10)));
++        });
++    }
++
++    // R9
++    #[test]
++    fn r9_grant_revoke_only_by_rd_owner() {
++        run(false, |stx, ids| {
++            let g = || Grant::account_permission(perm("CanSetParameters"), ids.a.clone());
++            denied_p1(exec(stx, &ids.a, g()));
++            ok(exec(stx, &ids.bi, g()));
++            denied_p1(exec(stx, &ids.a, Revoke::account_permission(perm("CanSetParameters"), ids.a.clone())));
++            ok(exec(stx, &ids.bi, Revoke::account_permission(perm("CanSetParameters"), ids.a.clone())));
++        });
++    }
++
++    #[test]
++    fn r9_unregister_and_policy_transition_owner_only() {
++        run(false, |stx, ids| {
++            ok(register_zk(stx, &ids.bi, &ids.rd, None));
++            denied_p1(exec(stx, &ids.a, Unregister::asset_definition(ids.rd.clone())));
++            denied_p1(exec(stx, &ids.a, Unregister::domain(DomainId::try_new("rd", "universal").unwrap())));
++            denied_p1(exec(
++                stx,
++                &ids.a,
++                CancelConfidentialPolicyTransition::new(ids.rd.clone(), iroha_crypto::Hash::new(b"t")),
++            ));
++            // not an authority failure for the owner (the transition does not exist)
++            let res = exec(
++                stx,
++                &ids.bi,
++                CancelConfidentialPolicyTransition::new(ids.rd.clone(), iroha_crypto::Hash::new(b"t")),
++            );
++            assert!(!is_p1(&res), "{res:?}");
++            ok(exec(stx, &ids.bi, Unregister::asset_definition(ids.rd.clone())));
++        });
++    }
++}
+-- 
+2.43.0
+

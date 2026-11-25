@@ -1,0 +1,936 @@
+From ee025298f5f2af3be29ce1859e81f01bc5db4c54 Mon Sep 17 00:00:00 2001
+From: rd-fork <rd-fork@localhost>
+Date: Tue, 24 Nov 2026 15:33:49 +0800
+Subject: [PATCH 2/2] 0002 P2 fail-closed BI disclosure envelope
+
+For asset definitions with rd_disclosure = required, Shield, ZkTransfer and
+Unshield are rejected unless they carry an RdEnvelopeV1 (spec 3.3-3.6): exact
+parse, same asset, audit key version active at the current height (keys in the
+rd_auditor account metadata rd_audit_keys), two ciphertexts of at least 17
+bytes, binding = SHA-256 over this instruction's nullifiers, outputs, amount and
+ciphertexts. Carrier: OpenVerifyEnvelope.aux, or tx metadata rd_envelope for
+Shield (new StateTransaction.current_tx_metadata). Errors start with
+rd-disclosure:. Other assets are unchanged.
+---
+ crates/iroha_core/src/block.rs                |   3 +
+ crates/iroha_core/src/executor.rs             |   1 +
+ crates/iroha_core/src/lib.rs                  |   1 +
+ crates/iroha_core/src/rd_disclosure.rs        | 778 ++++++++++++++++++
+ .../src/smartcontracts/isi/world.rs           |  27 +
+ crates/iroha_core/src/state.rs                |   4 +
+ 6 files changed, 814 insertions(+)
+ create mode 100644 crates/iroha_core/src/rd_disclosure.rs
+
+diff --git a/crates/iroha_core/src/block.rs b/crates/iroha_core/src/block.rs
+index 4948df87..4188f3cf 100644
+--- a/crates/iroha_core/src/block.rs
++++ b/crates/iroha_core/src/block.rs
+@@ -8966,6 +8966,7 @@ pub(crate) mod valid {
+                             let authority = tx.authority().clone();
+                             state_tx.tx_call_hash = Some(iroha_crypto::Hash::from(hash));
+                             state_tx.current_tx_hash = Some(tx.hash());
++                            state_tx.current_tx_metadata = Some(tx.metadata().clone());
+                             if missing_authority_requires_rejection(
+                                 &state_tx,
+                                 tx,
+@@ -9281,6 +9282,7 @@ pub(crate) mod valid {
+                                 Some(routing_decisions[idx].dataspace_id);
+                             state_tx.tx_call_hash = Some(iroha_crypto::Hash::from(hash));
+                             state_tx.current_tx_hash = Some(tx.hash());
++                            state_tx.current_tx_metadata = Some(tx.metadata().clone());
+                             let missing_authority = missing_authority_requires_rejection(
+                                 &state_tx,
+                                 tx,
+@@ -9462,6 +9464,7 @@ pub(crate) mod valid {
+                             Some(routing_decisions[idx].dataspace_id);
+                         state_tx.tx_call_hash = Some(iroha_crypto::Hash::from(hash));
+                         state_tx.current_tx_hash = Some(tx.hash());
++                        state_tx.current_tx_metadata = Some(tx.metadata().clone());
+                         let missing_authority = missing_authority_requires_rejection(
+                             &state_tx,
+                             tx,
+diff --git a/crates/iroha_core/src/executor.rs b/crates/iroha_core/src/executor.rs
+index f1a264a5..0f37455a 100644
+--- a/crates/iroha_core/src/executor.rs
++++ b/crates/iroha_core/src/executor.rs
+@@ -1904,6 +1904,7 @@ impl Executor {
+         state_transaction.tx_call_hash = Some(iroha_crypto::Hash::from(call_hash));
+         let tx_hash = transaction.hash();
+         state_transaction.current_tx_hash = Some(tx_hash.clone());
++        state_transaction.current_tx_metadata = Some(transaction.metadata().clone());
+         let settlement_source_id = {
+             let mut bytes = [0u8; iroha_crypto::Hash::LENGTH];
+             bytes.copy_from_slice(tx_hash.as_ref());
+diff --git a/crates/iroha_core/src/lib.rs b/crates/iroha_core/src/lib.rs
+index 4957ac8c..43403f47 100644
+--- a/crates/iroha_core/src/lib.rs
++++ b/crates/iroha_core/src/lib.rs
+@@ -83,6 +83,7 @@ pub mod compliance;
+ pub mod da;
+ /// Runtime executor integration and helpers.
+ pub mod executor;
++pub mod rd_disclosure;
+ pub mod rd_p1;
+ /// FASTPQ transcript helpers and host plumbing.
+ pub mod fastpq;
+diff --git a/crates/iroha_core/src/rd_disclosure.rs b/crates/iroha_core/src/rd_disclosure.rs
+new file mode 100644
+index 00000000..bb661884
+--- /dev/null
++++ b/crates/iroha_core/src/rd_disclosure.rs
+@@ -0,0 +1,778 @@
++//! RD fork patch P2: fail-closed BI disclosure envelope (spec `platforms/iroha2/docs/spec-g2-g5.md` 3.3-3.6).
++//!
++//! For an asset definition with metadata `rd_disclosure = "required"`, `Shield`, `ZkTransfer` and
++//! `Unshield` are rejected unless they carry an `RdEnvelopeV1` that parses exactly, names the same
++//! asset, uses an audit key version that is active at the current height (keys live in the metadata
++//! `rd_audit_keys` of the account named by the asset's `rd_auditor`), has two ciphertexts of at least
++//! 17 bytes, and whose `binding` equals the SHA-256 over this instruction's nullifiers, outputs,
++//! public amount and ciphertexts. The node never decrypts. Every error starts with `rd-disclosure:`.
++//! Assets without `rd_disclosure = "required"` (Kaigi fees, native escrow, other chains) are untouched.
++
++use iroha_data_model::{
++    account::AccountId,
++    asset::id::AssetDefinitionId,
++    isi::error::InstructionExecutionError,
++    proof::ProofBox,
++    zk::OpenVerifyEnvelope,
++};
++use iroha_primitives::json::Json;
++use sha2::{Digest, Sha256};
++
++use crate::state::{StateTransaction, WorldReadOnly};
++
++/// Asset definition metadata: `"required"` switches P2 on.
++pub const KEY_DISCLOSURE: &str = "rd_disclosure";
++/// Asset definition metadata: account id whose metadata holds the audit keys.
++pub const KEY_AUDITOR: &str = "rd_auditor";
++/// Auditor account metadata: JSON array of `{version, pk, activation_height, retire_height}`.
++pub const KEY_AUDIT_KEYS: &str = "rd_audit_keys";
++/// Transaction metadata key carrying the hex `RdEnvelopeV1` of a `Shield`.
++pub const KEY_ENVELOPE: &str = "rd_envelope";
++
++const MAGIC: &[u8; 4] = b"RDE1";
++const MIN_CT: usize = 17;
++
++/// Where the envelope travels.
++pub(crate) enum Carrier<'a> {
++    /// `OpenVerifyEnvelope.aux` inside the instruction's proof (`ZkTransfer`, `Unshield`).
++    Proof(&'a ProofBox),
++    /// Transaction metadata key `rd_envelope` (`Shield`).
++    TxMetadata,
++}
++
++/// One entry of `rd_audit_keys` (the node only needs the version window, not the public key).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct AuditKey {
++    /// Key version, matched against the envelope's `key_version`.
++    pub version: u32,
++    /// First height at which the key may be used.
++    pub activation_height: u64,
++    /// Height from which the key may no longer be used (`None` = never retired).
++    pub retire_height: Option<u64>,
++}
++
++/// Parsed `RdEnvelopeV1` (only the parts the node checks).
++#[derive(Debug)]
++pub struct Envelope<'a> {
++    /// Audit key version the BI ciphertext is addressed to.
++    pub key_version: u32,
++    /// Asset id string inside the envelope.
++    pub asset: &'a str,
++    /// BI ciphertext (tag included).
++    pub ct_bi: &'a [u8],
++    /// Recipient ciphertext (tag included).
++    pub ct_rc: &'a [u8],
++    /// Binding hash carried by the sender.
++    pub binding: [u8; 32],
++}
++
++struct Cursor<'a>(&'a [u8]);
++
++impl<'a> Cursor<'a> {
++    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
++        if self.0.len() < n {
++            return Err("envelope truncated".to_owned());
++        }
++        let (head, tail) = self.0.split_at(n);
++        self.0 = tail;
++        Ok(head)
++    }
++
++    fn u16(&mut self) -> Result<u16, String> {
++        Ok(u16::from_be_bytes(self.take(2)?.try_into().expect("2 bytes")))
++    }
++
++    fn u32(&mut self) -> Result<u32, String> {
++        Ok(u32::from_be_bytes(self.take(4)?.try_into().expect("4 bytes")))
++    }
++}
++
++/// Parse `RdEnvelopeV1` exactly; trailing bytes and short ciphertexts are errors.
++pub fn parse(bytes: &[u8]) -> Result<Envelope<'_>, String> {
++    let mut c = Cursor(bytes);
++    if c.take(4)? != MAGIC {
++        return Err("bad envelope magic".to_owned());
++    }
++    let key_version = c.u32()?;
++    let asset_len = usize::from(c.u16()?);
++    let asset = core::str::from_utf8(c.take(asset_len)?)
++        .map_err(|_| "envelope asset is not utf-8".to_owned())?;
++    let mut ct = |name: &str| -> Result<&[u8], String> {
++        c.take(32 + 24)?; // ephemeral public key, nonce
++        let len = usize::try_from(c.u32()?).map_err(|_| "ciphertext length overflow".to_owned())?;
++        let data = c.take(len)?;
++        if data.len() < MIN_CT {
++            return Err(format!("{name} ciphertext shorter than {MIN_CT} bytes"));
++        }
++        Ok(data)
++    };
++    let ct_bi = ct("bi")?;
++    let ct_rc = ct("recipient")?;
++    let binding: [u8; 32] = c.take(32)?.try_into().expect("32 bytes");
++    if !c.0.is_empty() {
++        return Err("trailing bytes after envelope".to_owned());
++    }
++    Ok(Envelope {
++        key_version,
++        asset,
++        ct_bi,
++        ct_rc,
++        binding,
++    })
++}
++
++/// Binding hash of spec 3.4.
++pub fn binding(
++    asset: &str,
++    inputs: &[[u8; 32]],
++    outputs: &[[u8; 32]],
++    public_amount: u128,
++    key_version: u32,
++    ct_bi: &[u8],
++    ct_rc: &[u8],
++) -> Result<[u8; 32], String> {
++    let asset_len = u16::try_from(asset.len()).map_err(|_| "asset id too long".to_owned())?;
++    let n_in = u8::try_from(inputs.len()).map_err(|_| "more than 255 inputs".to_owned())?;
++    let n_out = u8::try_from(outputs.len()).map_err(|_| "more than 255 outputs".to_owned())?;
++    let mut h = Sha256::new();
++    h.update(b"rd.iroha2.binding.v1");
++    h.update(asset_len.to_be_bytes());
++    h.update(asset.as_bytes());
++    h.update([n_in]);
++    inputs.iter().for_each(|i| h.update(i));
++    h.update([n_out]);
++    outputs.iter().for_each(|o| h.update(o));
++    h.update(public_amount.to_be_bytes());
++    h.update(key_version.to_be_bytes());
++    h.update(Sha256::digest(ct_bi));
++    h.update(Sha256::digest(ct_rc));
++    Ok(h.finalize().into())
++}
++
++/// Spec 3.6 on raw envelope bytes. `Err` carries the reason without the `rd-disclosure:` prefix.
++pub fn verify(
++    envelope: &[u8],
++    asset: &str,
++    inputs: &[[u8; 32]],
++    outputs: &[[u8; 32]],
++    public_amount: u128,
++    height: u64,
++    keys: &[AuditKey],
++) -> Result<(), String> {
++    let env = parse(envelope)?;
++    if env.asset != asset {
++        return Err(format!(
++            "envelope asset {} does not match instruction asset {asset}",
++            env.asset
++        ));
++    }
++    let key = keys
++        .iter()
++        .find(|k| k.version == env.key_version)
++        .ok_or_else(|| format!("unknown audit key version {}", env.key_version))?;
++    if key.activation_height > height || key.retire_height.is_some_and(|r| r <= height) {
++        return Err(format!(
++            "audit key version {} is not active at height {height}",
++            env.key_version
++        ));
++    }
++    let expected = binding(
++        asset,
++        inputs,
++        outputs,
++        public_amount,
++        env.key_version,
++        env.ct_bi,
++        env.ct_rc,
++    )?;
++    if expected != env.binding {
++        return Err("binding does not match this instruction".to_owned());
++    }
++    Ok(())
++}
++
++fn json_value(json: &Json) -> Result<norito::json::Value, String> {
++    norito::json::parse_value(json.get()).map_err(|_| "metadata is not valid JSON".to_owned())
++}
++
++fn json_string(json: &Json) -> Result<String, String> {
++    match json_value(json)? {
++        norito::json::Value::String(s) => Ok(s),
++        _ => Err("metadata is not a JSON string".to_owned()),
++    }
++}
++
++/// Parse `rd_audit_keys`.
++pub fn parse_audit_keys(json: &Json) -> Result<Vec<AuditKey>, String> {
++    let value = json_value(json)?;
++    let list = value
++        .as_array()
++        .ok_or_else(|| format!("{KEY_AUDIT_KEYS} is not a JSON array"))?;
++    list.iter()
++        .map(|entry| {
++            let version = entry
++                .get("version")
++                .and_then(norito::json::Value::as_u64)
++                .and_then(|v| u32::try_from(v).ok())
++                .ok_or_else(|| format!("{KEY_AUDIT_KEYS}: bad version"))?;
++            let activation_height = entry
++                .get("activation_height")
++                .and_then(norito::json::Value::as_u64)
++                .ok_or_else(|| format!("{KEY_AUDIT_KEYS}: bad activation_height"))?;
++            let retire_height = match entry.get("retire_height") {
++                None => None,
++                Some(v) if v.is_null() => None,
++                Some(v) => Some(
++                    v.as_u64()
++                        .ok_or_else(|| format!("{KEY_AUDIT_KEYS}: bad retire_height"))?,
++                ),
++            };
++            Ok(AuditKey {
++                version,
++                activation_height,
++                retire_height,
++            })
++        })
++        .collect()
++}
++
++fn rejected(reason: impl core::fmt::Display) -> InstructionExecutionError {
++    InstructionExecutionError::InvariantViolation(format!("rd-disclosure: {reason}").into())
++}
++
++/// Enforce P2 for one `Shield` / `ZkTransfer` / `Unshield` of `asset`.
++pub(crate) fn enforce(
++    st: &StateTransaction<'_, '_>,
++    asset: &AssetDefinitionId,
++    carrier: Carrier<'_>,
++    inputs: &[[u8; 32]],
++    outputs: &[[u8; 32]],
++    public_amount: u128,
++) -> Result<(), InstructionExecutionError> {
++    // Unknown definitions and assets without the flag keep the stock behaviour.
++    let Ok(definition) = st.world.asset_definition(asset) else {
++        return Ok(());
++    };
++    let required = definition
++        .metadata
++        .get(KEY_DISCLOSURE)
++        .is_some_and(|j| json_string(j).is_ok_and(|s| s == "required"));
++    if !required {
++        return Ok(());
++    }
++
++    let envelope: Vec<u8> = match carrier {
++        Carrier::Proof(proof) => {
++            let decoded = norito::decode_from_bytes::<OpenVerifyEnvelope>(&proof.bytes)
++                .map_err(|_| rejected("proof payload is not decodable, cannot read the envelope"))?;
++            if decoded.aux.is_empty() {
++                return Err(rejected("missing envelope (OpenVerifyEnvelope.aux is empty)"));
++            }
++            decoded.aux
++        }
++        Carrier::TxMetadata => {
++            let json = st
++                .current_tx_metadata
++                .as_ref()
++                .and_then(|m| m.get(KEY_ENVELOPE))
++                .ok_or_else(|| rejected(format!("missing envelope (transaction metadata {KEY_ENVELOPE})")))?;
++            let hex = json_string(json).map_err(|e| rejected(format!("{KEY_ENVELOPE}: {e}")))?;
++            hex::decode(hex).map_err(|_| rejected(format!("{KEY_ENVELOPE} is not hex")))?
++        }
++    };
++
++    let auditor_literal = definition
++        .metadata
++        .get(KEY_AUDITOR)
++        .ok_or_else(|| rejected(format!("asset has no {KEY_AUDITOR}")))
++        .and_then(|j| json_string(j).map_err(|e| rejected(format!("{KEY_AUDITOR}: {e}"))))?;
++    let auditor: AccountId = AccountId::parse_encoded(auditor_literal.trim())
++        .map(iroha_data_model::account::ParsedAccountId::into_account_id)
++        .map_err(|_| rejected(format!("{KEY_AUDITOR} is not an account id")))?;
++    let account = st
++        .world
++        .account(&auditor)
++        .map_err(|_| rejected("auditor account does not exist"))?;
++    let keys_json = account
++        .metadata
++        .get(KEY_AUDIT_KEYS)
++        .ok_or_else(|| rejected(format!("auditor account has no {KEY_AUDIT_KEYS}")))?;
++    let keys = parse_audit_keys(keys_json).map_err(rejected)?;
++
++    verify(
++        &envelope,
++        &asset.to_string(),
++        inputs,
++        outputs,
++        public_amount,
++        st.block_height(),
++        &keys,
++    )
++    .map_err(rejected)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn hexb(s: &str) -> Vec<u8> {
++        hex::decode(s).unwrap()
++    }
++
++    /// Build RdEnvelopeV1 bytes from parts; ephemeral keys and nonces are filler (the node never reads them).
++    fn build(asset: &str, version: u32, ct_bi: &[u8], ct_rc: &[u8], binding: [u8; 32]) -> Vec<u8> {
++        let mut v = b"RDE1".to_vec();
++        v.extend(version.to_be_bytes());
++        v.extend(u16::try_from(asset.len()).unwrap().to_be_bytes());
++        v.extend(asset.as_bytes());
++        for ct in [ct_bi, ct_rc] {
++            v.extend([1u8; 32]);
++            v.extend([2u8; 24]);
++            v.extend(u32::try_from(ct.len()).unwrap().to_be_bytes());
++            v.extend(ct);
++        }
++        v.extend(binding);
++        v
++    }
++
++    const IN: [[u8; 32]; 1] = [[0x11; 32]];
++    const OUT: [[u8; 32]; 2] = [[0x22; 32], [0x33; 32]];
++
++    fn ct_bi() -> Vec<u8> {
++        (0..40u8).collect()
++    }
++
++    fn ct_rc() -> Vec<u8> {
++        vec![0xAA; 20]
++    }
++
++    fn keys() -> Vec<AuditKey> {
++        vec![AuditKey {
++            version: 1,
++            activation_height: 1,
++            retire_height: None,
++        }]
++    }
++
++    fn good() -> Vec<u8> {
++        let b = binding("rd#rd", &IN, &OUT, 250, 1, &ct_bi(), &ct_rc()).unwrap();
++        build("rd#rd", 1, &ct_bi(), &ct_rc(), b)
++    }
++
++    fn check(env: &[u8], keys: &[AuditKey], height: u64) -> Result<(), String> {
++        verify(env, "rd#rd", &IN, &OUT, 250, height, keys)
++    }
++
++    #[test]
++    fn binding_matches_independent_computation() {
++        // computed with python hashlib from spec 3.4, not with this code
++        let b = binding("rd#rd", &IN, &OUT, 250, 1, &ct_bi(), &ct_rc()).unwrap();
++        assert_eq!(
++            hex::encode(b),
++            "bcb354312a30536165055d07b6b388120a136bba02e07b47163f9ec7e5fed0f0"
++        );
++    }
++
++    #[test]
++    fn correct_envelope_accepted() {
++        assert_eq!(check(&good(), &keys(), 2), Ok(()));
++    }
++
++    #[test]
++    fn empty_envelope_rejected() {
++        assert!(check(&[], &keys(), 2).is_err());
++    }
++
++    #[test]
++    fn wrong_asset_rejected() {
++        let e = verify(&good(), "rd#other", &IN, &OUT, 250, 2, &keys()).unwrap_err();
++        assert!(e.contains("does not match instruction asset"), "{e}");
++    }
++
++    #[test]
++    fn trailing_bytes_rejected() {
++        let mut e = good();
++        e.push(0);
++        assert_eq!(check(&e, &keys(), 2), Err("trailing bytes after envelope".into()));
++    }
++
++    #[test]
++    fn truncated_and_bad_magic_rejected() {
++        let e = good();
++        assert!(check(&e[..e.len() - 1], &keys(), 2).is_err());
++        let mut bad = e;
++        bad[3] = b'2';
++        assert_eq!(check(&bad, &keys(), 2), Err("bad envelope magic".into()));
++    }
++
++    #[test]
++    fn unknown_inactive_and_retired_key_rejected() {
++        let mut e = good();
++        e[7] = 9; // key_version 9
++        assert!(check(&e, &keys(), 2).unwrap_err().contains("unknown audit key version"));
++        let future = [AuditKey { version: 1, activation_height: 5, retire_height: None }];
++        assert!(check(&good(), &future, 2).unwrap_err().contains("not active"));
++        let retired = [AuditKey { version: 1, activation_height: 1, retire_height: Some(2) }];
++        assert!(check(&good(), &retired, 2).unwrap_err().contains("not active"));
++        // a window that covers the height is accepted (overlap during rotation)
++        let window = [AuditKey { version: 1, activation_height: 2, retire_height: Some(3) }];
++        assert_eq!(check(&good(), &window, 2), Ok(()));
++    }
++
++    #[test]
++    fn short_ciphertext_rejected() {
++        let b = binding("rd#rd", &IN, &OUT, 250, 1, &ct_bi(), &[0xAA; 16]).unwrap();
++        let e = build("rd#rd", 1, &ct_bi(), &[0xAA; 16], b);
++        assert!(check(&e, &keys(), 2).unwrap_err().contains("shorter than 17"));
++        let b = binding("rd#rd", &IN, &OUT, 250, 1, &[0xAA; 16], &ct_rc()).unwrap();
++        let e = build("rd#rd", 1, &[0xAA; 16], &ct_rc(), b);
++        assert!(check(&e, &keys(), 2).unwrap_err().contains("shorter than 17"));
++    }
++
++    #[test]
++    fn binding_mismatch_rejected() {
++        let mut e = good();
++        let last = e.len() - 1;
++        e[last] ^= 1;
++        assert!(check(&e, &keys(), 2).unwrap_err().contains("binding"));
++        // envelope is valid for other outputs / amount / inputs
++        assert!(verify(&good(), "rd#rd", &IN, &OUT[..1], 250, 2, &keys()).unwrap_err().contains("binding"));
++        assert!(verify(&good(), "rd#rd", &IN, &OUT, 251, 2, &keys()).unwrap_err().contains("binding"));
++        assert!(verify(&good(), "rd#rd", &[], &OUT, 250, 2, &keys()).unwrap_err().contains("binding"));
++    }
++
++    #[test]
++    fn audit_keys_json_parsed() {
++        let j = Json::from_string_unchecked(
++            r#"[{"version":1,"pk":"00","activation_height":1,"retire_height":null},{"version":2,"pk":"11","activation_height":10,"retire_height":20}]"#.to_owned(),
++        );
++        let k = parse_audit_keys(&j).unwrap();
++        assert_eq!(k.len(), 2);
++        assert_eq!(k[0].retire_height, None);
++        assert_eq!(k[1], AuditKey { version: 2, activation_height: 10, retire_height: Some(20) });
++        assert!(parse_audit_keys(&Json::from_string_unchecked("{}".to_owned())).is_err());
++    }
++
++    /// Vectors written by stream S2 (`platforms/iroha2/driver/tests/vectors/envelope_v1.json`).
++    /// Skipped when the file is not mounted next to the workspace (`crates/rd_driver`).
++    #[test]
++    fn s2_vectors() {
++        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../rd_driver/tests/vectors/envelope_v1.json");
++        let Ok(text) = std::fs::read_to_string(path) else {
++            eprintln!("s2_vectors: {path} not found, skipped");
++            return;
++        };
++        let doc = norito::json::parse_value(&text).expect("vector file is JSON");
++        let h32 = |v: &norito::json::Value| -> [u8; 32] {
++            hexb(v.as_str().expect("hex string")).try_into().expect("32 bytes")
++        };
++        let instr = |v: &norito::json::Value| {
++            let list = |k: &str| -> Vec<[u8; 32]> {
++                v.get(k).unwrap().as_array().unwrap().iter().map(h32).collect()
++            };
++            (
++                v.get("asset").unwrap().as_str().unwrap().to_owned(),
++                list("inputs"),
++                list("outputs"),
++                v.get("public_amount").unwrap().as_str().unwrap().parse::<u128>().unwrap(),
++            )
++        };
++        let run = |env_hex: &str, instruction: &norito::json::Value, version: u32| {
++            let (asset, ins, outs, amount) = instr(instruction);
++            let keys = [AuditKey { version, activation_height: 1, retire_height: None }];
++            verify(&hexb(env_hex), &asset, &ins, &outs, amount, 2, &keys)
++        };
++        let cases = doc.get("cases").unwrap().as_array().unwrap();
++        assert!(!cases.is_empty());
++        for c in cases {
++            let name = c.get("name").unwrap().as_str().unwrap();
++            let version = u32::try_from(c.get("key_version").unwrap().as_u64().unwrap()).unwrap();
++            let res = run(c.get("envelope_hex").unwrap().as_str().unwrap(), c.get("instruction").unwrap(), version);
++            assert_eq!(res, Ok(()), "case {name}");
++        }
++        for n in doc.get("negative").unwrap().as_array().unwrap() {
++            let desc = n.get("description").unwrap().as_str().unwrap();
++            let expect = n.get("expect").unwrap().as_str().unwrap();
++            let res = run(n.get("envelope_hex").unwrap().as_str().unwrap(), n.get("instruction").unwrap(), 1);
++            match expect {
++                "parse_ok, binding_ok" => assert_eq!(res, Ok(()), "{desc}"),
++                "parse_error" => {
++                    let e = res.expect_err(desc);
++                    assert!(!e.contains("binding") && !e.contains("match instruction"), "{desc}: {e}");
++                }
++                "binding_mismatch" => {
++                    assert!(res.expect_err(desc).contains("binding"), "{desc}");
++                }
++                "asset_mismatch" => {
++                    assert!(res.expect_err(desc).contains("does not match instruction asset"), "{desc}");
++                }
++                other => panic!("unknown expectation {other}"),
++            }
++        }
++    }
++
++    // ---- chain-level: Shield / ZkTransfer / Unshield through the Initial executor ----
++
++    use iroha_crypto::KeyPair;
++    use iroha_data_model::{
++        Registrable as _,
++        account::Account,
++        asset::{AssetDefinition, id::AssetId},
++        block::BlockHeader,
++        confidential::ConfidentialEncryptedPayload,
++        isi::{
++            InstructionBox, Mint, SetKeyValue,
++            zk::{RegisterZkAsset, Shield, Unshield, ZkAssetMode, ZkTransfer},
++        },
++        metadata::Metadata,
++        prelude::{Domain, DomainId},
++        proof::{ProofAttachment, VerifyingKeyBox},
++        zk::BackendTag,
++    };
++    use nonzero_ext::nonzero;
++
++    use crate::{
++        executor::Executor,
++        kura::Kura,
++        query::store::LiveQueryStore,
++        state::{State, StateTransaction, World},
++    };
++
++    struct Ids {
++        bi: AccountId,
++        a: AccountId,
++        rd: AssetDefinitionId,
++        plain: AssetDefinitionId,
++    }
++
++    fn acct() -> AccountId {
++        AccountId::new(KeyPair::random().into_parts().0)
++    }
++
++    fn name(s: &str) -> iroha_data_model::name::Name {
++        s.parse().unwrap()
++    }
++
++    const KEYS_ACTIVE: &str =
++        r#"[{"version":1,"pk":"00","activation_height":1,"retire_height":null}]"#;
++
++    /// Block 2 world: domain rd owned by bi; `rd` (disclosure required, auditor bi, keys `keys_json`),
++    /// `plain` (no flag); `a` holds 100 of both and both are registered as zk assets.
++    fn world_run(keys_json: &str, f: impl FnOnce(&mut StateTransaction<'_, '_>, &Ids)) {
++        let domain = DomainId::try_new("rd", "universal").unwrap();
++        let ids = Ids {
++            bi: acct(),
++            a: acct(),
++            rd: AssetDefinitionId::new(domain.clone(), name("rd")),
++            plain: AssetDefinitionId::new(domain.clone(), name("plain")),
++        };
++        let def = |id: &AssetDefinitionId| {
++            AssetDefinition::numeric(id.clone()).with_name(id.name().to_string()).build(&ids.bi)
++        };
++        let world = World::with_assets(
++            [Domain::new(domain).build(&ids.bi)],
++            [&ids.bi, &ids.a].map(|id| Account::new(id.clone()).build(id)),
++            [def(&ids.rd), def(&ids.plain)],
++            [],
++            [],
++        );
++        let state = State::new(world, Kura::blank_kura_for_testing(), LiveQueryStore::start_test());
++        state
++            .block(BlockHeader::new(nonzero!(1_u64), None, None, None, 0, 0))
++            .commit()
++            .expect("bootstrap block");
++        let mut block = state.block(BlockHeader::new(nonzero!(2_u64), None, None, None, 0, 0));
++        let mut stx = block.transaction();
++        let run = |stx: &mut StateTransaction<'_, '_>, who: &AccountId, isi: InstructionBox| {
++            Executor::Initial
++                .execute_instruction(stx, who, isi)
++                .unwrap_or_else(|e| panic!("setup failed: {e:?}"));
++        };
++        let set = |stx: &mut StateTransaction<'_, '_>, k: &str, v: Json| {
++            run(stx, &ids.bi, SetKeyValue::asset_definition(ids.rd.clone(), name(k), v).into());
++        };
++        set(&mut stx, KEY_DISCLOSURE, Json::new("required"));
++        set(&mut stx, KEY_AUDITOR, Json::new(ids.bi.to_string()));
++        run(
++            &mut stx,
++            &ids.bi,
++            SetKeyValue::account(
++                ids.bi.clone(),
++                name(KEY_AUDIT_KEYS),
++                Json::from_string_unchecked(keys_json.to_owned()),
++            )
++            .into(),
++        );
++        for def in [&ids.rd, &ids.plain] {
++            run(
++                &mut stx,
++                &ids.bi,
++                RegisterZkAsset::new(def.clone(), ZkAssetMode::Hybrid, true, true, None, None, None).into(),
++            );
++            run(
++                &mut stx,
++                &ids.bi,
++                Mint::asset_numeric(100_u32, AssetId::new(def.clone(), ids.a.clone())).into(),
++            );
++        }
++        f(&mut stx, &ids);
++    }
++
++    fn exec(stx: &mut StateTransaction<'_, '_>, who: &AccountId, isi: impl Into<InstructionBox>) -> String {
++        match Executor::Initial.execute_instruction(stx, who, isi.into()) {
++            Ok(()) => "ok".to_owned(),
++            Err(e) => format!("{e:?}"),
++        }
++    }
++
++    const CM: [u8; 32] = [7; 32];
++
++    fn shield_env(asset: &str) -> Vec<u8> {
++        let b = binding(asset, &[], &[CM], 5, 1, &ct_bi(), &ct_rc()).unwrap();
++        build(asset, 1, &ct_bi(), &ct_rc(), b)
++    }
++
++    fn with_envelope(stx: &mut StateTransaction<'_, '_>, bytes: &[u8]) {
++        let mut md = Metadata::default();
++        md.insert(name(KEY_ENVELOPE), Json::new(hex::encode(bytes)));
++        stx.current_tx_metadata = Some(md);
++    }
++
++    fn shield(ids: &Ids, asset: &AssetDefinitionId) -> Shield {
++        Shield::new(asset.clone(), ids.a.clone(), 5, CM, ConfidentialEncryptedPayload::default())
++    }
++
++    #[test]
++    fn shield_missing_envelope_rejected() {
++        world_run(KEYS_ACTIVE, |stx, ids| {
++            let r = exec(stx, &ids.a, shield(ids, &ids.rd));
++            assert!(r.contains("rd-disclosure: missing envelope"), "{r}");
++            // metadata present but without the key
++            stx.current_tx_metadata = Some(Metadata::default());
++            let r = exec(stx, &ids.a, shield(ids, &ids.rd));
++            assert!(r.contains("rd-disclosure: missing envelope"), "{r}");
++        });
++    }
++
++    #[test]
++    fn shield_correct_envelope_accepted() {
++        world_run(KEYS_ACTIVE, |stx, ids| {
++            with_envelope(stx, &shield_env(&ids.rd.to_string()));
++            assert_eq!(exec(stx, &ids.a, shield(ids, &ids.rd)), "ok");
++        });
++    }
++
++    #[test]
++    fn shield_bad_envelopes_rejected() {
++        world_run(KEYS_ACTIVE, |stx, ids| {
++            let asset = ids.rd.to_string();
++            let good = shield_env(&asset);
++            let mut trailing = good.clone();
++            trailing.push(0);
++            let mut flipped = good.clone();
++            *flipped.last_mut().unwrap() ^= 1;
++            let mut v9 = good.clone();
++            v9[7] = 9;
++            let short = {
++                let b = binding(&asset, &[], &[CM], 5, 1, &ct_bi(), &[1u8; 16]).unwrap();
++                build(&asset, 1, &ct_bi(), &[1u8; 16], b)
++            };
++            let cases: [(&str, Vec<u8>, &str); 5] = [
++                ("wrong asset", shield_env("rd#other"), "does not match instruction asset"),
++                ("trailing", trailing, "trailing bytes"),
++                ("unknown key version", v9, "unknown audit key version"),
++                ("short ct", short, "shorter than 17"),
++                ("binding", flipped, "binding"),
++            ];
++            for (what, env, needle) in cases {
++                with_envelope(stx, &env);
++                let r = exec(stx, &ids.a, shield(ids, &ids.rd));
++                assert!(r.contains("rd-disclosure:") && r.contains(needle), "{what}: {r}");
++            }
++            // metadata that is not hex
++            let mut md = Metadata::default();
++            md.insert(name(KEY_ENVELOPE), Json::new("zz"));
++            stx.current_tx_metadata = Some(md);
++            let r = exec(stx, &ids.a, shield(ids, &ids.rd));
++            assert!(r.contains("rd-disclosure:") && r.contains("not hex"), "{r}");
++            // the envelope binds the shield: another amount or commitment does not pass
++            with_envelope(stx, &good);
++            let other = Shield::new(ids.rd.clone(), ids.a.clone(), 6, CM, ConfidentialEncryptedPayload::default());
++            let r = exec(stx, &ids.a, other);
++            assert!(r.contains("rd-disclosure:") && r.contains("binding"), "{r}");
++        });
++    }
++
++    #[test]
++    fn inactive_key_rejected_even_with_valid_binding() {
++        let future = r#"[{"version":1,"pk":"00","activation_height":5,"retire_height":null}]"#;
++        world_run(future, |stx, ids| {
++            with_envelope(stx, &shield_env(&ids.rd.to_string()));
++            let r = exec(stx, &ids.a, shield(ids, &ids.rd));
++            assert!(r.contains("rd-disclosure:") && r.contains("not active"), "{r}");
++        });
++    }
++
++    #[test]
++    fn asset_without_flag_unchanged() {
++        world_run(KEYS_ACTIVE, |stx, ids| {
++            // no envelope, no tx metadata: stock behaviour
++            assert_eq!(exec(stx, &ids.a, shield(ids, &ids.plain)), "ok");
++        });
++    }
++
++    fn proof_with_aux(aux: Vec<u8>) -> ProofAttachment {
++        let mut env = OpenVerifyEnvelope::new(BackendTag::Halo2IpaPasta, "c", [0; 32], vec![], vec![]);
++        env.aux = aux;
++        let bytes = norito::to_bytes(&env).expect("encode envelope");
++        ProofAttachment::new_inline(
++            "halo2/ipa".into(),
++            iroha_data_model::proof::ProofBox::new("halo2/ipa".into(), bytes),
++            VerifyingKeyBox::new("halo2/ipa".into(), vec![1]),
++        )
++    }
++
++    const NF: [[u8; 32]; 1] = [[0x11; 32]];
++    const OUTS: [[u8; 32]; 2] = [[0x22; 32], [0x33; 32]];
++
++    fn env_for(asset: &AssetDefinitionId, amount: u128) -> Vec<u8> {
++        let a = asset.to_string();
++        let b = binding(&a, &NF, &OUTS, amount, 1, &ct_bi(), &ct_rc()).unwrap();
++        build(&a, 1, &ct_bi(), &ct_rc(), b)
++    }
++
++    fn transfer(asset: &AssetDefinitionId, aux: Vec<u8>) -> ZkTransfer {
++        ZkTransfer::new(asset.clone(), NF.to_vec(), OUTS.to_vec(), proof_with_aux(aux), None)
++    }
++
++    fn unshield(ids: &Ids, asset: &AssetDefinitionId, aux: Vec<u8>) -> Unshield {
++        Unshield::new_with_outputs(asset.clone(), ids.a.clone(), 250, NF.to_vec(), OUTS.to_vec(), proof_with_aux(aux), None)
++    }
++
++    #[test]
++    fn zk_transfer_and_unshield_envelope_rules() {
++        world_run(KEYS_ACTIVE, |stx, ids| {
++            // missing aux
++            let r = exec(stx, &ids.a, transfer(&ids.rd, vec![]));
++            assert!(r.contains("rd-disclosure: missing envelope"), "{r}");
++            let r = exec(stx, &ids.a, unshield(ids, &ids.rd, vec![]));
++            assert!(r.contains("rd-disclosure: missing envelope"), "{r}");
++            // binding is per kind: a transfer envelope (amount 0) does not fit an unshield of 250
++            let r = exec(stx, &ids.a, unshield(ids, &ids.rd, env_for(&ids.rd, 0)));
++            assert!(r.contains("rd-disclosure:") && r.contains("binding"), "{r}");
++            // wrong asset inside
++            let mut other = env_for(&ids.rd, 0);
++            other[4 + 4 + 2 + 3] ^= 1; // last asset byte
++            let r = exec(stx, &ids.a, transfer(&ids.rd, other));
++            assert!(r.contains("rd-disclosure:") && r.contains("does not match instruction asset"), "{r}");
++            // correct envelopes pass the P2 check (the proof itself is not valid here, so a later error is fine)
++            let r = exec(stx, &ids.a, transfer(&ids.rd, env_for(&ids.rd, 0)));
++            assert!(!r.contains("rd-disclosure:"), "{r}");
++            let r = exec(stx, &ids.a, unshield(ids, &ids.rd, env_for(&ids.rd, 250)));
++            assert!(!r.contains("rd-disclosure:"), "{r}");
++            // asset without the flag: no envelope needed
++            let r = exec(stx, &ids.a, transfer(&ids.plain, vec![]));
++            assert!(!r.contains("rd-disclosure:"), "{r}");
++        });
++    }
++}
+diff --git a/crates/iroha_core/src/smartcontracts/isi/world.rs b/crates/iroha_core/src/smartcontracts/isi/world.rs
+index 620e85b9..cf6e120f 100644
+--- a/crates/iroha_core/src/smartcontracts/isi/world.rs
++++ b/crates/iroha_core/src/smartcontracts/isi/world.rs
+@@ -8256,6 +8256,15 @@ pub mod isi {
+             // Policy: ZkNative always ok; Hybrid requires allow_shield.
+             let asset_id = AssetId::of(self.asset().clone(), self.from().clone());
+             let def_id = self.asset().clone();
++            // RD fork patch P2: fail-closed BI disclosure envelope (only for rd_disclosure = "required").
++            crate::rd_disclosure::enforce(
++                state_transaction,
++                &def_id,
++                crate::rd_disclosure::Carrier::TxMetadata,
++                &[],
++                &[*self.note_commitment()],
++                *self.amount(),
++            )?;
+             let policy_mode = apply_policy_if_due(state_transaction, &def_id)?.mode();
+             match policy_mode {
+                 ConfidentialPolicyMode::TransparentOnly => {
+@@ -8392,6 +8401,15 @@ pub mod isi {
+             // Consume nullifiers and append outputs in shielded ledger; no public balance change here.
+             // Emit a metadata pulse for observability under a reserved transient key.
+             let asset_def_id = self.asset().clone();
++            // RD fork patch P2: fail-closed BI disclosure envelope (only for rd_disclosure = "required").
++            crate::rd_disclosure::enforce(
++                state_transaction,
++                &asset_def_id,
++                crate::rd_disclosure::Carrier::Proof(&self.proof().proof),
++                self.inputs(),
++                self.outputs(),
++                0,
++            )?;
+             let mut st = state_transaction
+                 .world
+                 .zk_assets
+@@ -8671,6 +8689,15 @@ pub mod isi {
+             // Consume nullifiers and credit public balance by minting.
+             let asset_id = AssetId::of(self.asset().clone(), self.to().clone());
+             let def_id = self.asset().clone();
++            // RD fork patch P2: fail-closed BI disclosure envelope (only for rd_disclosure = "required").
++            crate::rd_disclosure::enforce(
++                state_transaction,
++                &def_id,
++                crate::rd_disclosure::Carrier::Proof(&self.proof().proof),
++                self.inputs(),
++                self.outputs(),
++                *self.public_amount(),
++            )?;
+             let policy_mode = apply_policy_if_due(state_transaction, &def_id)?.mode();
+             match policy_mode {
+                 ConfidentialPolicyMode::TransparentOnly | ConfidentialPolicyMode::ShieldedOnly => {
+diff --git a/crates/iroha_core/src/state.rs b/crates/iroha_core/src/state.rs
+index 5c58fde6..28d5be03 100644
+--- a/crates/iroha_core/src/state.rs
++++ b/crates/iroha_core/src/state.rs
+@@ -6454,6 +6454,9 @@ pub struct StateTransaction<'block, 'state> {
+     /// Canonical hash of the current signed transaction, when executing a transaction.
+     pub current_tx_hash:
+         Option<iroha_crypto::HashOf<iroha_data_model::transaction::SignedTransaction>>,
++    /// Metadata of the current signed transaction, when executing a transaction
++    /// (RD fork patch P2 reads the `Shield` envelope from it). Not set for ad-hoc execution.
++    pub current_tx_metadata: Option<iroha_data_model::metadata::Metadata>,
+     /// True while rebuilding state from already committed Kura blocks.
+     pub(crate) replay_compatibility: bool,
+     /// Deterministic per-transaction ordinal used when generating canonical RWA lot ids.
+@@ -21975,6 +21978,7 @@ impl<'state> StateBlock<'state> {
+             confidential_gas_used_in_block_so_far: self.confidential_gas_used_in_block,
+             tx_call_hash: None,
+             current_tx_hash: None,
++            current_tx_metadata: None,
+             rwa_generated_id_ordinal: 0,
+             executor_fuel_remaining: None,
+             replay_compatibility: self.replay_compatibility,
+-- 
+2.43.0
+

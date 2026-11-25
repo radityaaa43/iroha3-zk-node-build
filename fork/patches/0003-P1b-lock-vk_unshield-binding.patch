@@ -1,0 +1,103 @@
+From 58b143eff3553f7f325f363e7f63838685bf6113 Mon Sep 17 00:00:00 2001
+From: rd-fork <rd-fork@localhost>
+Date: Tue, 24 Nov 2026 16:07:08 +0800
+Subject: [PATCH] 0003 P1b lock vk_unshield binding
+
+Once vk_unshield is bound on an rd asset it cannot be changed, cleared or re-bound
+to an updated record, same as vk_transfer (rule 4). Closes the F2 gap S1 reported:
+an unbound Unshield skips the v2 checks.
+---
+ crates/iroha_core/src/rd_p1.rs | 56 ++++++++++++++++++++++++++++------
+ 1 file changed, 46 insertions(+), 10 deletions(-)
+
+diff --git a/crates/iroha_core/src/rd_p1.rs b/crates/iroha_core/src/rd_p1.rs
+index cf439cd5..1927a65d 100644
+--- a/crates/iroha_core/src/rd_p1.rs
++++ b/crates/iroha_core/src/rd_p1.rs
+@@ -3,7 +3,7 @@
+ //! Active only when a domain named `rd` exists in the world ("rd mode"), and never in the genesis
+ //! block. Called from the `Initial` executor (`executor.rs::execute_initial_instruction`) before the
+ //! stock checks, so it can only tighten them. Spec: `platforms/iroha2/docs/spec-g2-g5.md` section 4.
+-//! Rules 1-8 are the spec; R9 (grant/revoke, unregister, policy transitions) is added because without
++//! Rules 1-8 are the spec (rule 4 also locks `vk_unshield`, patch 0003); R9 (grant/revoke, unregister, policy transitions) is added because without
+ //! it rules 5 and 7 can be bypassed (the stock executor lets any account grant itself any permission).
+ //! Every error starts with `rd-authority:`.
+ 
+@@ -277,15 +277,21 @@ pub(crate) fn check(
+     if let Some(r) = extract::<RegisterZkAsset>(i) {
+         if in_rd(&r.asset) {
+             require_def_owner(w, authority, &r.asset, "register zk asset")?;
+-            if let Some(locked) = w.zk_assets.get(&r.asset).and_then(|s| s.vk_transfer.clone()) {
+-                let same = r.vk_transfer.as_ref().is_some_and(|id| {
+-                    id == &locked.id
+-                        && w.verifying_keys
+-                            .get(id)
+-                            .is_some_and(|rec| rec.commitment == locked.commitment)
+-                });
+-                if !same {
+-                    return Err(denied("vk_transfer is bound and cannot be changed or cleared"));
++            if let Some(state) = w.zk_assets.get(&r.asset) {
++                for (what, locked, requested) in [
++                    ("vk_transfer", &state.vk_transfer, &r.vk_transfer),
++                    ("vk_unshield", &state.vk_unshield, &r.vk_unshield),
++                ] {
++                    let Some(locked) = locked else { continue };
++                    let same = requested.as_ref().is_some_and(|id| {
++                        id == &locked.id
++                            && w.verifying_keys
++                                .get(id)
++                                .is_some_and(|rec| rec.commitment == locked.commitment)
++                    });
++                    if !same {
++                        return Err(denied(format!("{what} is bound and cannot be changed or cleared")));
++                    }
+                 }
+             }
+         }
+@@ -544,6 +550,11 @@ mod tests {
+         exec(stx, who, RegisterZkAsset::new(def.clone(), ZkAssetMode::Hybrid, true, true, vk_transfer, None, None))
+     }
+ 
++    fn register_zk_unshield(stx: &mut StateTransaction<'_, '_>, who: &AccountId, def: &AssetDefinitionId,
++        vk_transfer: Option<VerifyingKeyId>, vk_unshield: Option<VerifyingKeyId>) -> Result<(), ValidationFail> {
++        exec(stx, who, RegisterZkAsset::new(def.clone(), ZkAssetMode::Hybrid, true, true, vk_transfer, vk_unshield, None))
++    }
++
+     fn shield(ids: &Ids, def: &AssetDefinitionId, from: &AccountId) -> Shield {
+         Shield::new(def.clone(), from.clone(), 5, [7u8; 32], ConfidentialEncryptedPayload::default())
+     }
+@@ -623,6 +634,31 @@ mod tests {
+         });
+     }
+ 
++    #[test]
++    fn r4_vk_unshield_cannot_change_or_clear() {
++        run(false, |stx, ids| {
++            Grant::account_permission(perm("CanManageVerifyingKeys"), ids.bi.clone())
++                .execute(&ids.bi, stx)
++                .unwrap();
++            let t = VerifyingKeyId::new("halo2/ipa", "vk_t");
++            let u1 = VerifyingKeyId::new("halo2/ipa", "vk_u1");
++            let u2 = VerifyingKeyId::new("halo2/ipa", "vk_u2");
++            for (id, bytes) in [(&t, vec![1]), (&u1, vec![2]), (&u2, vec![3])] {
++                ok(exec(stx, &ids.bi, RegisterVerifyingKey { id: id.clone(), record: vk_record(1, bytes).1 }));
++            }
++            // not yet bound: any value (also None) is fine
++            ok(register_zk_unshield(stx, &ids.bi, &ids.rd, Some(t.clone()), None));
++            ok(register_zk_unshield(stx, &ids.bi, &ids.rd, Some(t.clone()), Some(u1.clone())));
++            denied_p1(register_zk_unshield(stx, &ids.bi, &ids.rd, Some(t.clone()), None)); // clear
++            denied_p1(register_zk_unshield(stx, &ids.bi, &ids.rd, Some(t.clone()), Some(u2))); // change
++            // same key, same commitment: allowed
++            ok(register_zk_unshield(stx, &ids.bi, &ids.rd, Some(t.clone()), Some(u1.clone())));
++            // record updated since binding: rebinding refused
++            ok(exec(stx, &ids.bi, UpdateVerifyingKey { id: u1.clone(), record: vk_record(2, vec![9, 9]).1 }));
++            denied_p1(register_zk_unshield(stx, &ids.bi, &ids.rd, Some(t), Some(u1)));
++        });
++    }
++
+     // Rule 5
+     #[test]
+     fn r5_vk_management_needs_permission() {
+-- 
+2.43.0
+

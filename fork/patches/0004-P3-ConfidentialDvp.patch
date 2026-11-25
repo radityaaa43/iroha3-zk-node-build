@@ -1,0 +1,1135 @@
+From 9f075f68e97a7175212f0f285953c359e61d575d Mon Sep 17 00:00:00 2001
+From: rd-fork <rd-fork@localhost>
+Date: Tue, 24 Nov 2026 17:00:20 +0800
+Subject: [PATCH] 0004 P3 ConfidentialDvp
+
+New instruction ConfidentialDvp: DFABI and RD ZkTransfer legs executed together or not at all,
+two signed intents over one tuple (trade id, chain id, expiry height, legs' asset, nullifiers
+and outputs), single-use trade id and award id in WSV, optional BI-signed award for UC-03.
+Legs run through the stock ZkTransfer execution so P2 and all proof checks apply.
+---
+ crates/iroha_core/src/gas.rs                  |  12 +
+ crates/iroha_core/src/lib.rs                  |   1 +
+ crates/iroha_core/src/rd_disclosure.rs        |   2 +-
+ crates/iroha_core/src/rd_dvp.rs               | 761 ++++++++++++++++++
+ .../iroha_core/src/smartcontracts/isi/mod.rs  |   1 +
+ crates/iroha_core/src/state.rs                |  19 +
+ crates/iroha_data_model/src/isi/mod.rs        |   5 +
+ crates/iroha_data_model/src/isi/registry.rs   |   1 +
+ crates/iroha_data_model/src/isi/zk.rs         | 112 +++
+ 9 files changed, 913 insertions(+), 1 deletion(-)
+ create mode 100644 crates/iroha_core/src/rd_dvp.rs
+
+diff --git a/crates/iroha_core/src/gas.rs b/crates/iroha_core/src/gas.rs
+index d260745b..2a6fe7a3 100644
+--- a/crates/iroha_core/src/gas.rs
++++ b/crates/iroha_core/src/gas.rs
+@@ -396,6 +396,12 @@ pub fn meter_instruction(instr: &InstructionBox) -> u64 {
+     if let Some(unshield) = any.downcast_ref::<dm_isi::zk::Unshield>() {
+         return gas_for_proof_attachment(&unshield.proof, unshield.inputs.len(), 0);
+     }
++    if let Some(dvp) = any.downcast_ref::<dm_isi::zk::ConfidentialDvp>() {
++        return [&dvp.delivery, &dvp.payment]
++            .into_iter()
++            .map(|leg| gas_for_proof_attachment(&leg.proof, leg.inputs.len(), leg.outputs.len()))
++            .sum();
++    }
+     if let Some(ballot) = any.downcast_ref::<dm_isi::zk::SubmitBallot>() {
+         return gas_for_proof_attachment(&ballot.ballot_proof, 1, 0);
+     }
+@@ -443,6 +449,12 @@ pub fn confidential_gas_cost(instr: &InstructionBox) -> u64 {
+     if let Some(unshield) = any.downcast_ref::<dm_isi::zk::Unshield>() {
+         return gas_for_proof_attachment(&unshield.proof, unshield.inputs.len(), 0);
+     }
++    if let Some(dvp) = any.downcast_ref::<dm_isi::zk::ConfidentialDvp>() {
++        return [&dvp.delivery, &dvp.payment]
++            .into_iter()
++            .map(|leg| gas_for_proof_attachment(&leg.proof, leg.inputs.len(), leg.outputs.len()))
++            .sum();
++    }
+     if let Some(ballot) = any.downcast_ref::<dm_isi::zk::SubmitBallot>() {
+         return gas_for_proof_attachment(&ballot.ballot_proof, 1, 0);
+     }
+diff --git a/crates/iroha_core/src/lib.rs b/crates/iroha_core/src/lib.rs
+index 43403f47..73d35b8f 100644
+--- a/crates/iroha_core/src/lib.rs
++++ b/crates/iroha_core/src/lib.rs
+@@ -84,6 +84,7 @@ pub mod da;
+ /// Runtime executor integration and helpers.
+ pub mod executor;
+ pub mod rd_disclosure;
++pub mod rd_dvp;
+ pub mod rd_p1;
+ /// FASTPQ transcript helpers and host plumbing.
+ pub mod fastpq;
+diff --git a/crates/iroha_core/src/rd_disclosure.rs b/crates/iroha_core/src/rd_disclosure.rs
+index bb661884..b67ef2fa 100644
+--- a/crates/iroha_core/src/rd_disclosure.rs
++++ b/crates/iroha_core/src/rd_disclosure.rs
+@@ -195,7 +195,7 @@ fn json_value(json: &Json) -> Result<norito::json::Value, String> {
+     norito::json::parse_value(json.get()).map_err(|_| "metadata is not valid JSON".to_owned())
+ }
+ 
+-fn json_string(json: &Json) -> Result<String, String> {
++pub(crate) fn json_string(json: &Json) -> Result<String, String> {
+     match json_value(json)? {
+         norito::json::Value::String(s) => Ok(s),
+         _ => Err("metadata is not a JSON string".to_owned()),
+diff --git a/crates/iroha_core/src/rd_dvp.rs b/crates/iroha_core/src/rd_dvp.rs
+new file mode 100644
+index 00000000..ba2f2d5e
+--- /dev/null
++++ b/crates/iroha_core/src/rd_dvp.rs
+@@ -0,0 +1,761 @@
++//! RD fork patch P3: `ConfidentialDvp`, atomic confidential delivery-versus-payment (blueprint gate G4B).
++//!
++//! One instruction carries a DFABI leg (`delivery`) and an RD leg (`payment`), both ordinary
++//! `ZkTransfer`s, plus two signed intents over one immutable settlement tuple. It runs both legs
++//! through the existing `Execute for ZkTransfer` (so P2's envelope check and every v2 proof check
++//! apply to each leg) or neither: any error aborts the transaction, which is discarded unapplied
++//! (`tx.rs::validate_transaction` calls `state_transaction.apply()` only on `Ok`; the instruction
++//! loop is `executor.rs::execute_transaction`, `for isi in instructions { execute_instruction(..)? }`).
++//! Every error starts with `rd-dvp:`. Spec: `platforms/iroha2/docs/spec-g2-g5.md`; design D2 in
++//! `platforms/iroha2/docs/research/g4-dfabi-dvp.md`.
++//!
++//! # Settlement tuple (what each party signs)
++//! ```text
++//! digest = SHA-256( "rd.iroha2.dvp.v1"                       (16 bytes, ASCII)
++//!                   || trade_id                              (32)
++//!                   || u16be(len chain_id) || chain_id utf8
++//!                   || u64be(expiry_height)
++//!                   || leg(delivery) || leg(payment) )
++//! leg   = u16be(len asset) || asset utf8                     (AssetDefinitionId::to_string())
++//!         || u8(n_in)  || nullifier_0  || ... (32 B each, as submitted)
++//!         || u8(n_out) || commitment_0 || ... (32 B each, as submitted)
++//! ```
++//! Each intent signature is an Iroha `Signature` of the signer's account key over the 32 digest bytes.
++//!
++//! # Award (UC-03)
++//! ```text
++//! award_digest = SHA-256( "rd.iroha2.award.v1" (18 bytes) || u16be(len chain_id) || chain_id utf8
++//!                         || award_id (32) || u16be(len winner) || winner utf8   (AccountId::to_string())
++//!                         || u16be(len instrument) || instrument utf8
++//!                         || u128be(quantity) || u128be(consideration) || u64be(expiry_height) )
++//! ```
++//! signed by the owner of domain `rd`. Quantity and consideration are not checked against the legs
++//! (their amounts are hidden by the ZK proof); they are the signed award record, BI also signs the trade tuple.
++
++use iroha_crypto::Hash;
++use iroha_data_model::{
++    account::AccountId,
++    asset::id::AssetDefinitionId,
++    isi::{
++        error::InstructionExecutionError,
++        zk::{ConfidentialDvp, DvpKind, SignedAward, ZkTransfer},
++    },
++};
++use mv::storage::StorageReadOnly;
++use sha2::{Digest, Sha256};
++
++use crate::{
++    smartcontracts::Execute,
++    state::{StateReadOnly, StateTransaction, WorldReadOnly},
++};
++
++const TAG_TUPLE: &[u8] = b"rd.iroha2.dvp.v1";
++const TAG_AWARD: &[u8] = b"rd.iroha2.award.v1";
++const TAG_TRADE_KEY: &[u8] = b"rd.iroha2.dvp.trade-key.v1";
++const TAG_AWARD_KEY: &[u8] = b"rd.iroha2.dvp.award-key.v1";
++/// Asset definition metadata that P2 keys on; both DvP legs must carry it as `"required"`.
++const KEY_DISCLOSURE: &str = crate::rd_disclosure::KEY_DISCLOSURE;
++/// Domain whose owner signs awards (`bi`).
++const RD_DOMAIN: &str = crate::rd_p1::RD_DOMAIN;
++
++fn rejected(msg: impl core::fmt::Display) -> InstructionExecutionError {
++    InstructionExecutionError::InvariantViolation(format!("rd-dvp: {msg}").into())
++}
++
++fn put_str(h: &mut Sha256, s: &str) -> Result<(), String> {
++    let n = u16::try_from(s.len()).map_err(|_| "string longer than 65535 bytes".to_owned())?;
++    h.update(n.to_be_bytes());
++    h.update(s.as_bytes());
++    Ok(())
++}
++
++fn put_leg(h: &mut Sha256, leg: &ZkTransfer) -> Result<(), String> {
++    put_str(h, &leg.asset().to_string())?;
++    let n_in = u8::try_from(leg.inputs().len()).map_err(|_| "more than 255 nullifiers".to_owned())?;
++    h.update([n_in]);
++    leg.inputs().iter().for_each(|n| h.update(n));
++    let n_out = u8::try_from(leg.outputs().len()).map_err(|_| "more than 255 outputs".to_owned())?;
++    h.update([n_out]);
++    leg.outputs().iter().for_each(|o| h.update(o));
++    Ok(())
++}
++
++/// Digest both parties sign (see the module doc for the exact encoding).
++pub fn settlement_digest(
++    chain_id: &str,
++    trade_id: &[u8; 32],
++    expiry_height: u64,
++    delivery: &ZkTransfer,
++    payment: &ZkTransfer,
++) -> Result<[u8; 32], String> {
++    let mut h = Sha256::new();
++    h.update(TAG_TUPLE);
++    h.update(trade_id);
++    put_str(&mut h, chain_id)?;
++    h.update(expiry_height.to_be_bytes());
++    put_leg(&mut h, delivery)?;
++    put_leg(&mut h, payment)?;
++    Ok(h.finalize().into())
++}
++
++/// Digest the owner of domain `rd` signs for an award (see the module doc).
++pub fn award_digest(chain_id: &str, award: &SignedAward) -> Result<[u8; 32], String> {
++    let mut h = Sha256::new();
++    h.update(TAG_AWARD);
++    put_str(&mut h, chain_id)?;
++    h.update(award.award_id);
++    put_str(&mut h, &award.winner.to_string())?;
++    put_str(&mut h, &award.instrument.to_string())?;
++    h.update(award.quantity.to_be_bytes());
++    h.update(award.consideration.to_be_bytes());
++    h.update(award.expiry_height.to_be_bytes());
++    Ok(h.finalize().into())
++}
++
++/// Key under which a used trade id is stored: tagged BLAKE2b-256 (`Hash` forces the last bit to 1).
++fn trade_key(trade_id: &[u8; 32]) -> Hash {
++    Hash::new([TAG_TRADE_KEY, trade_id.as_slice()].concat())
++}
++
++fn award_key(award_id: &[u8; 32]) -> Hash {
++    Hash::new([TAG_AWARD_KEY, award_id.as_slice()].concat())
++}
++
++fn disclosure_required(st: &StateTransaction<'_, '_>, asset: &AssetDefinitionId) -> bool {
++    st.world.asset_definition(asset).is_ok_and(|d| {
++        d.metadata
++            .get(KEY_DISCLOSURE)
++            .is_some_and(|j| crate::rd_disclosure::json_string(j).is_ok_and(|v| v == "required"))
++    })
++}
++
++fn verify_signature(
++    who: &AccountId,
++    signature: &iroha_crypto::Signature,
++    digest: &[u8; 32],
++    what: &str,
++) -> Result<(), InstructionExecutionError> {
++    let key = who
++        .try_signatory()
++        .ok_or_else(|| rejected(format!("{what} {who} is not a single-key account")))?;
++    signature
++        .verify(key, digest)
++        .map_err(|_| rejected(format!("invalid {what} signature of {who}")))
++}
++
++fn check_award(
++    st: &StateTransaction<'_, '_>,
++    dvp: &ConfidentialDvp,
++    award: &SignedAward,
++    signers: [&AccountId; 2],
++    chain_id: &str,
++) -> Result<(), InstructionExecutionError> {
++    let owner = st
++        .world
++        .domains_iter()
++        .find(|d| d.id.name().to_string() == RD_DOMAIN)
++        .map(|d| d.owned_by().clone())
++        .ok_or_else(|| rejected("award needs domain `rd`"))?;
++    if st.block_height() > award.expiry_height {
++        return Err(rejected(format!(
++            "award expired (height {} > expiry_height {})",
++            st.block_height(),
++            award.expiry_height
++        )));
++    }
++    if st.world.rd_dvp_used.get(&award_key(&award.award_id)).is_some() {
++        return Err(rejected("award_id already used"));
++    }
++    if !signers.contains(&&award.winner) {
++        return Err(rejected("award winner is not one of the two signers"));
++    }
++    if !signers.contains(&&owner) {
++        return Err(rejected("an award trade must be signed by the owner of domain `rd`"));
++    }
++    if &award.instrument != dvp.delivery().asset() {
++        return Err(rejected("award instrument is not the delivery asset"));
++    }
++    let digest = award_digest(chain_id, award).map_err(rejected)?;
++    verify_signature(&owner, &award.bi_signature, &digest, "award")
++}
++
++fn check(
++    st: &StateTransaction<'_, '_>,
++    authority: &AccountId,
++    dvp: &ConfidentialDvp,
++) -> Result<(), InstructionExecutionError> {
++    let chain_id = st.chain_id().as_str().to_owned();
++    if st.block_height() > *dvp.expiry_height() {
++        return Err(rejected(format!(
++            "expired (height {} > expiry_height {})",
++            st.block_height(),
++            dvp.expiry_height()
++        )));
++    }
++    if st.world.rd_dvp_used.get(&trade_key(dvp.trade_id())).is_some() {
++        return Err(rejected("trade_id already used"));
++    }
++    let (delivery, payment) = (dvp.delivery().asset(), dvp.payment().asset());
++    if delivery == payment {
++        return Err(rejected("delivery and payment must be different assets"));
++    }
++    for (name, asset) in [("delivery", delivery), ("payment", payment)] {
++        if !disclosure_required(st, asset) {
++            return Err(rejected(format!(
++                "{name} asset {asset} does not have {KEY_DISCLOSURE} = \"required\""
++            )));
++        }
++    }
++
++    let [i0, i1] = dvp.intents();
++    let signers = [&i0.signer, &i1.signer];
++    if signers[0] == signers[1] {
++        return Err(rejected("the two intents must come from different signers"));
++    }
++    if !signers.contains(&authority) {
++        return Err(rejected("transaction authority must be one of the two signers"));
++    }
++    let digest = settlement_digest(
++        &chain_id,
++        dvp.trade_id(),
++        *dvp.expiry_height(),
++        dvp.delivery(),
++        dvp.payment(),
++    )
++    .map_err(rejected)?;
++    for intent in [i0, i1] {
++        if st.world.account(&intent.signer).is_err() {
++            return Err(rejected(format!("signer {} is not a registered account", intent.signer)));
++        }
++        verify_signature(&intent.signer, &intent.signature, &digest, "intent")?;
++    }
++
++    match (dvp.kind(), dvp.award()) {
++        (DvpKind::Interbank, None) => Ok(()),
++        (DvpKind::Interbank, Some(_)) => Err(rejected("an interbank trade carries no award")),
++        (DvpKind::Award, None) => Err(rejected("an award trade needs a signed award")),
++        (DvpKind::Award, Some(award)) => check_award(st, dvp, award, signers, &chain_id),
++    }
++}
++
++impl Execute for ConfidentialDvp {
++    fn execute(
++        self,
++        authority: &AccountId,
++        st: &mut StateTransaction<'_, '_>,
++    ) -> Result<(), InstructionExecutionError> {
++        check(st, authority, &self)?;
++
++        st.world.rd_dvp_used.insert(trade_key(self.trade_id()), ());
++        if let Some(award) = self.award() {
++            st.world.rd_dvp_used.insert(award_key(&award.award_id), ());
++        }
++
++        // Both legs through the stock path; a failure in either rejects the instruction and with it
++        // the transaction, so nothing of the other leg (or of the used-id markers) is applied.
++        for (name, leg) in [("delivery", self.delivery()), ("payment", self.payment())] {
++            leg.clone()
++                .execute(authority, st)
++                .map_err(|e| rejected(format!("{name} leg failed: {e}")))?;
++        }
++
++        iroha_logger::info!(
++            trade_id = %hex::encode(self.trade_id()),
++            delivery_asset = %self.delivery().asset(),
++            delivery_outputs = ?self.delivery().outputs().iter().map(hex::encode).collect::<Vec<_>>(),
++            payment_asset = %self.payment().asset(),
++            payment_outputs = ?self.payment().outputs().iter().map(hex::encode).collect::<Vec<_>>(),
++            "rd-dvp settled"
++        );
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use iroha_crypto::{KeyPair, Signature};
++    use iroha_data_model::{
++        Registrable as _,
++        account::Account,
++        asset::AssetDefinition,
++        block::BlockHeader,
++        isi::{
++            InstructionBox, SetKeyValue,
++            zk::{DvpIntent, RegisterZkAsset, ZkAssetMode},
++        },
++        prelude::{Domain, DomainId},
++        proof::{ProofAttachment, ProofBox, VerifyingKeyBox},
++        zk::{BackendTag, OpenVerifyEnvelope},
++    };
++    use iroha_primitives::json::Json;
++    use nonzero_ext::nonzero;
++
++    use super::*;
++    use crate::{
++        executor::Executor,
++        kura::Kura,
++        query::store::LiveQueryStore,
++        rd_disclosure::{self, binding},
++        state::{State, StateBlock, World},
++    };
++
++    struct P {
++        kp: KeyPair,
++        id: AccountId,
++    }
++
++    fn party() -> P {
++        let kp = KeyPair::random();
++        P { id: AccountId::new(kp.public_key().clone()), kp }
++    }
++
++    struct W {
++        bi: P,
++        a: P,
++        b: P,
++        c: P,
++        /// not registered in the world
++        ghost: P,
++        rd: AssetDefinitionId,
++        dfabi: AssetDefinitionId,
++        plain: AssetDefinitionId,
++    }
++
++    fn name(s: &str) -> iroha_data_model::name::Name {
++        s.parse().unwrap()
++    }
++
++    const KEYS: &str = r#"[{"version":1,"pk":"00","activation_height":1,"retire_height":null}]"#;
++
++    /// Block 2 on a world with domain `rd` owned by `bi`; `rd` and `dfabi` are zk assets with
++    /// `rd_disclosure = "required"` (auditor `bi`, key version 1 active), `plain` is a zk asset without it.
++    /// The setup transaction is applied; tests open their own transactions on the block.
++    fn world(f: impl FnOnce(&mut StateBlock<'_>, &W)) {
++        let domain = DomainId::try_new("rd", "universal").unwrap();
++        let w = W {
++            bi: party(),
++            a: party(),
++            b: party(),
++            c: party(),
++            ghost: party(),
++            rd: AssetDefinitionId::new(domain.clone(), name("rd")),
++            dfabi: AssetDefinitionId::new(domain.clone(), name("dfabi")),
++            plain: AssetDefinitionId::new(domain.clone(), name("plain")),
++        };
++        let def = |id: &AssetDefinitionId| {
++            AssetDefinition::numeric(id.clone()).with_name(id.name().to_string()).build(&w.bi.id)
++        };
++        let world = World::with_assets(
++            [Domain::new(domain).build(&w.bi.id)],
++            [&w.bi, &w.a, &w.b, &w.c].map(|p| Account::new(p.id.clone()).build(&p.id)),
++            [def(&w.rd), def(&w.dfabi), def(&w.plain)],
++            [],
++            [],
++        );
++        let state = State::new(world, Kura::blank_kura_for_testing(), LiveQueryStore::start_test());
++        state
++            .block(BlockHeader::new(nonzero!(1_u64), None, None, None, 0, 0))
++            .commit()
++            .expect("bootstrap block");
++        let mut block = state.block(BlockHeader::new(nonzero!(2_u64), None, None, None, 0, 0));
++        {
++            let mut stx = block.transaction();
++            let mut run = |isi: InstructionBox| {
++                Executor::Initial
++                    .execute_instruction(&mut stx, &w.bi.id, isi)
++                    .unwrap_or_else(|e| panic!("setup failed: {e:?}"));
++            };
++            for asset in [&w.rd, &w.dfabi] {
++                let set = |k: &str, v: Json| {
++                    SetKeyValue::asset_definition(asset.clone(), name(k), v).into()
++                };
++                run(set(rd_disclosure::KEY_DISCLOSURE, Json::new("required")));
++                run(set(rd_disclosure::KEY_AUDITOR, Json::new(w.bi.id.to_string())));
++            }
++            run(SetKeyValue::account(
++                w.bi.id.clone(),
++                name(rd_disclosure::KEY_AUDIT_KEYS),
++                Json::from_string_unchecked(KEYS.to_owned()),
++            )
++            .into());
++            for asset in [&w.rd, &w.dfabi, &w.plain] {
++                run(RegisterZkAsset::new(asset.clone(), ZkAssetMode::Hybrid, true, true, None, None, None)
++                    .into());
++            }
++            drop(run);
++            stx.apply();
++        }
++        f(&mut block, &w);
++    }
++
++    fn envelope(asset: &AssetDefinitionId, nf: &[[u8; 32]], outs: &[[u8; 32]]) -> Vec<u8> {
++        let (ct_bi, ct_rc) = ((0..40u8).collect::<Vec<_>>(), vec![0xAA; 20]);
++        let a = asset.to_string();
++        let b = binding(&a, nf, outs, 0, 1, &ct_bi, &ct_rc).unwrap();
++        let mut v = b"RDE1".to_vec();
++        v.extend(1u32.to_be_bytes());
++        v.extend(u16::try_from(a.len()).unwrap().to_be_bytes());
++        v.extend(a.as_bytes());
++        for ct in [&ct_bi, &ct_rc] {
++            v.extend([1u8; 32]);
++            v.extend([2u8; 24]);
++            v.extend(u32::try_from(ct.len()).unwrap().to_be_bytes());
++            v.extend(ct);
++        }
++        v.extend(b);
++        v
++    }
++
++    /// `debug/ok` accepts any proof bytes, `debug/reject` refuses them: the stock proof check is reached.
++    fn leg_with(
++        asset: &AssetDefinitionId,
++        backend: &str,
++        nf: [u8; 32],
++        out: [u8; 32],
++        aux: Option<Vec<u8>>,
++    ) -> ZkTransfer {
++        let mut env = OpenVerifyEnvelope::new(BackendTag::Halo2IpaPasta, "c", [0; 32], vec![], vec![]);
++        env.aux = aux.unwrap_or_default();
++        let bytes = norito::to_bytes(&env).expect("encode envelope");
++        ZkTransfer::new(
++            asset.clone(),
++            vec![nf],
++            vec![out],
++            ProofAttachment::new_inline(
++                backend.into(),
++                ProofBox::new(backend.into(), bytes),
++                VerifyingKeyBox::new(backend.into(), vec![1]),
++            ),
++            None,
++        )
++    }
++
++    /// A leg that passes P2 and the proof check.
++    fn good_leg(asset: &AssetDefinitionId, n: u8) -> ZkTransfer {
++        leg_with(asset, "debug/ok", [n; 32], [n + 1; 32], Some(envelope(asset, &[[n; 32]], &[[n + 1; 32]])))
++    }
++
++    fn chain(stx: &StateTransaction<'_, '_>) -> String {
++        stx.chain_id().as_str().to_owned()
++    }
++
++    fn sign(p: &P, digest: &[u8; 32]) -> Signature {
++        Signature::new(p.kp.private_key(), digest)
++    }
++
++    fn intents(chain: &str, id: &[u8; 32], expiry: u64, d: &ZkTransfer, p: &ZkTransfer, who: [&P; 2]) -> [DvpIntent; 2] {
++        let digest = settlement_digest(chain, id, expiry, d, p).unwrap();
++        who.map(|s| DvpIntent { signer: s.id.clone(), signature: sign(s, &digest) })
++    }
++
++    fn interbank(chain: &str, id: [u8; 32], expiry: u64, d: ZkTransfer, p: ZkTransfer, who: [&P; 2]) -> ConfidentialDvp {
++        let it = intents(chain, &id, expiry, &d, &p, who);
++        ConfidentialDvp::new(id, d, p, expiry, it, DvpKind::Interbank, None)
++    }
++
++    fn award(chain: &str, signer: &P, id: [u8; 32], winner: &P, instrument: &AssetDefinitionId, expiry: u64) -> SignedAward {
++        let mut a = SignedAward {
++            award_id: id,
++            winner: winner.id.clone(),
++            instrument: instrument.clone(),
++            quantity: 10,
++            consideration: 9_900,
++            expiry_height: expiry,
++            bi_signature: Signature::from_bytes(&[]),
++        };
++        a.bi_signature = sign(signer, &award_digest(chain, &a).unwrap());
++        a
++    }
++
++    fn award_trade(chain: &str, id: [u8; 32], d: ZkTransfer, p: ZkTransfer, who: [&P; 2], aw: SignedAward) -> ConfidentialDvp {
++        let it = intents(chain, &id, 100, &d, &p, who);
++        ConfidentialDvp::new(id, d, p, 100, it, DvpKind::Award, Some(aw))
++    }
++
++    fn exec(stx: &mut StateTransaction<'_, '_>, who: &P, dvp: ConfidentialDvp) -> String {
++        match Executor::Initial.execute_instruction(stx, &who.id, InstructionBox::from(dvp)) {
++            Ok(()) => "ok".to_owned(),
++            Err(e) => format!("{e:?}"),
++        }
++    }
++
++    fn spent(stx: &StateTransaction<'_, '_>, asset: &AssetDefinitionId, nf: u8) -> bool {
++        stx.world.zk_assets.get(asset).is_some_and(|s| s.nullifiers.contains(&[nf; 32]))
++    }
++
++    fn used(stx: &StateTransaction<'_, '_>, id: &[u8; 32]) -> bool {
++        stx.world.rd_dvp_used.get(&trade_key(id)).is_some()
++    }
++
++    #[track_caller]
++    fn has(res: &str, needle: &str) {
++        assert!(res.contains(needle), "expected `{needle}` in: {res}");
++    }
++
++    const T1: [u8; 32] = [0xA1; 32];
++    const T2: [u8; 32] = [0xA2; 32];
++
++    fn asset_id(domain: &str, n: &str) -> AssetDefinitionId {
++        AssetDefinitionId::new(DomainId::try_new(domain, "universal").unwrap(), name(n))
++    }
++
++    /// The digest equals a hand-built preimage of the documented encoding and binds every field.
++    #[test]
++    fn rd_dvp_digest_matches_documented_encoding_and_binds_every_field() {
++        let (da, pa) = (asset_id("rd", "dfabi"), asset_id("rd", "rd"));
++        let d = leg_with(&da, "debug/ok", [1; 32], [2; 32], None);
++        let p = leg_with(&pa, "debug/ok", [3; 32], [4; 32], None);
++        let mut pre = b"rd.iroha2.dvp.v1".to_vec();
++        pre.extend([9u8; 32]);
++        pre.extend(1u16.to_be_bytes());
++        pre.extend(b"c");
++        pre.extend(7u64.to_be_bytes());
++        for (asset, nf, out) in [(&da, 1u8, 2u8), (&pa, 3, 4)] {
++            let s = asset.to_string();
++            pre.extend(u16::try_from(s.len()).unwrap().to_be_bytes());
++            pre.extend(s.as_bytes());
++            pre.push(1);
++            pre.extend([nf; 32]);
++            pre.push(1);
++            pre.extend([out; 32]);
++        }
++        let expected: [u8; 32] = Sha256::digest(&pre).into();
++        let base = settlement_digest("c", &[9; 32], 7, &d, &p).unwrap();
++        assert_eq!(base, expected);
++        assert_ne!(base, settlement_digest("c2", &[9; 32], 7, &d, &p).unwrap());
++        assert_ne!(base, settlement_digest("c", &[8; 32], 7, &d, &p).unwrap());
++        assert_ne!(base, settlement_digest("c", &[9; 32], 8, &d, &p).unwrap());
++        assert_ne!(base, settlement_digest("c", &[9; 32], 7, &p, &d).unwrap());
++    }
++
++    #[test]
++    fn rd_dvp_interbank_happy_path_runs_both_legs_and_burns_the_trade_id() {
++        world(|block, w| {
++            let mut stx = block.transaction();
++            let ch = chain(&stx);
++            let d = good_leg(&w.dfabi, 0x10);
++            let p = good_leg(&w.rd, 0x20);
++            let r = exec(&mut stx, &w.a, interbank(&ch, T1, 100, d, p, [&w.a, &w.b]));
++            assert_eq!(r, "ok");
++            assert!(spent(&stx, &w.dfabi, 0x10) && spent(&stx, &w.rd, 0x20));
++            assert!(used(&stx, &T1));
++            // replay of the same trade id, even with fresh notes, is refused
++            let d = good_leg(&w.dfabi, 0x30);
++            let p = good_leg(&w.rd, 0x40);
++            let r = exec(&mut stx, &w.b, interbank(&ch, T1, 100, d, p, [&w.a, &w.b]));
++            has(&r, "rd-dvp: trade_id already used");
++            assert!(!spent(&stx, &w.dfabi, 0x30) && !spent(&stx, &w.rd, 0x40));
++        });
++    }
++
++    #[test]
++    fn rd_dvp_expired_is_rejected() {
++        world(|block, w| {
++            let mut stx = block.transaction();
++            let ch = chain(&stx);
++            let (d, p) = (good_leg(&w.dfabi, 0x10), good_leg(&w.rd, 0x20));
++            // block height is 2: expiry 2 still fine, 1 is over
++            let r = exec(&mut stx, &w.a, interbank(&ch, T1, 1, d.clone(), p.clone(), [&w.a, &w.b]));
++            has(&r, "rd-dvp: expired");
++            assert!(!spent(&stx, &w.dfabi, 0x10) && !used(&stx, &T1));
++            assert_eq!(exec(&mut stx, &w.a, interbank(&ch, T1, 2, d, p, [&w.a, &w.b])), "ok");
++        });
++    }
++
++    #[test]
++    fn rd_dvp_intent_failures() {
++        world(|block, w| {
++            let mut stx = block.transaction();
++            let ch = chain(&stx);
++            let (d, p) = (good_leg(&w.dfabi, 0x10), good_leg(&w.rd, 0x20));
++            let ok = || interbank(&ch, T1, 100, d.clone(), p.clone(), [&w.a, &w.b]);
++
++            // tuple tampered after signing (payment output swapped)
++            let mut t = ok();
++            let evil = good_leg(&w.rd, 0x50);
++            t = ConfidentialDvp::new(T1, d.clone(), evil, 100, t.intents().clone(), DvpKind::Interbank, None);
++            has(&exec(&mut stx, &w.a, t), "rd-dvp: invalid intent signature of");
++
++            // signature missing (empty) for the second party
++            let mut it = ok().intents().clone();
++            it[1].signature = Signature::from_bytes(&[]);
++            let t = ConfidentialDvp::new(T1, d.clone(), p.clone(), 100, it, DvpKind::Interbank, None);
++            has(&exec(&mut stx, &w.a, t), "rd-dvp: invalid intent signature of");
++
++            // intent of b signed by c's key
++            let digest = settlement_digest(&ch, &T1, 100, &d, &p).unwrap();
++            let mut it = ok().intents().clone();
++            it[1].signature = sign(&w.c, &digest);
++            let t = ConfidentialDvp::new(T1, d.clone(), p.clone(), 100, it, DvpKind::Interbank, None);
++            has(&exec(&mut stx, &w.a, t), "rd-dvp: invalid intent signature of");
++
++            // duplicate signer
++            let r = exec(&mut stx, &w.a, interbank(&ch, T1, 100, d.clone(), p.clone(), [&w.a, &w.a]));
++            has(&r, "rd-dvp: the two intents must come from different signers");
++
++            // submitter is neither signer
++            let r = exec(&mut stx, &w.c, ok());
++            has(&r, "rd-dvp: transaction authority must be one of the two signers");
++
++            // unregistered signer (valid signature)
++            let r = exec(&mut stx, &w.a, interbank(&ch, T1, 100, d.clone(), p.clone(), [&w.a, &w.ghost]));
++            has(&r, "is not a registered account");
++
++            // wrong chain id in the signed tuple
++            let r = exec(&mut stx, &w.a, interbank(&format!("{ch}-other"), T1, 100, d.clone(), p.clone(), [&w.a, &w.b]));
++            has(&r, "rd-dvp: invalid intent signature of");
++
++            // none of the above touched state; the correct one still goes through
++            assert!(!spent(&stx, &w.dfabi, 0x10) && !used(&stx, &T1));
++            assert_eq!(exec(&mut stx, &w.b, ok()), "ok");
++        });
++    }
++
++    #[test]
++    fn rd_dvp_kind_and_award_presence_must_match() {
++        world(|block, w| {
++            let mut stx = block.transaction();
++            let ch = chain(&stx);
++            let (d, p) = (good_leg(&w.dfabi, 0x10), good_leg(&w.rd, 0x20));
++            let it = intents(&ch, &T1, 100, &d, &p, [&w.bi, &w.a]);
++            let aw = award(&ch, &w.bi, [5; 32], &w.a, &w.dfabi, 100);
++            let t = ConfidentialDvp::new(T1, d.clone(), p.clone(), 100, it.clone(), DvpKind::Award, None);
++            has(&exec(&mut stx, &w.a, t), "rd-dvp: an award trade needs a signed award");
++            let t = ConfidentialDvp::new(T1, d, p, 100, it, DvpKind::Interbank, Some(aw));
++            has(&exec(&mut stx, &w.a, t), "rd-dvp: an interbank trade carries no award");
++        });
++    }
++
++    #[test]
++    fn rd_dvp_same_asset_or_unflagged_asset_is_rejected() {
++        world(|block, w| {
++            let mut stx = block.transaction();
++            let ch = chain(&stx);
++            let (d, p) = (good_leg(&w.dfabi, 0x10), good_leg(&w.dfabi, 0x20));
++            let r = exec(&mut stx, &w.a, interbank(&ch, T1, 100, d, p, [&w.a, &w.b]));
++            has(&r, "rd-dvp: delivery and payment must be different assets");
++            let (d, p) = (good_leg(&w.dfabi, 0x10), good_leg(&w.plain, 0x20));
++            let r = exec(&mut stx, &w.a, interbank(&ch, T1, 100, d, p, [&w.a, &w.b]));
++            has(&r, "rd-dvp: payment asset");
++            has(&r, "does not have rd_disclosure");
++        });
++    }
++
++    #[test]
++    fn rd_dvp_leg_without_envelope_rejects_the_whole_dvp() {
++        world(|block, w| {
++            // Each scenario in its own transaction, dropped without apply() like a rejected transaction.
++            {
++                let mut stx = block.transaction();
++                let ch = chain(&stx);
++                let d = good_leg(&w.dfabi, 0x10);
++                let p = leg_with(&w.rd, "debug/ok", [0x20; 32], [0x21; 32], None); // P2 envelope missing
++                let r = exec(&mut stx, &w.a, interbank(&ch, T1, 100, d, p, [&w.a, &w.b]));
++                has(&r, "rd-dvp: payment leg failed");
++                has(&r, "rd-disclosure: missing envelope");
++            }
++            {
++                let mut stx = block.transaction();
++                let ch = chain(&stx);
++                let d = leg_with(&w.dfabi, "debug/ok", [0x10; 32], [0x11; 32], None);
++                let p = good_leg(&w.rd, 0x20);
++                let r = exec(&mut stx, &w.a, interbank(&ch, T1, 100, d, p, [&w.a, &w.b]));
++                has(&r, "rd-dvp: delivery leg failed");
++                has(&r, "rd-disclosure: missing envelope");
++            }
++            let stx = block.transaction();
++            assert!(!spent(&stx, &w.dfabi, 0x10) && !spent(&stx, &w.rd, 0x20));
++            assert!(!used(&stx, &T1));
++        });
++    }
++
++    #[test]
++    fn rd_dvp_failing_second_leg_rolls_back_the_first_with_the_transaction() {
++        world(|block, w| {
++            {
++                let mut stx = block.transaction();
++                let ch = chain(&stx);
++                let d = good_leg(&w.dfabi, 0x10);
++                // valid envelope, but the proof check refuses: the stock check of leg 2 was reached
++                let aux = envelope(&w.rd, &[[0x20; 32]], &[[0x21; 32]]);
++                let p = leg_with(&w.rd, "debug/reject", [0x20; 32], [0x21; 32], Some(aux));
++                let r = exec(&mut stx, &w.a, interbank(&ch, T1, 100, d, p, [&w.a, &w.b]));
++                has(&r, "rd-dvp: payment leg failed");
++                has(&r, "invalid transfer proof");
++                // Inside the failed transaction leg 1 was already staged: atomicity is the
++                // transaction's (an Err from any instruction discards the staged state).
++                assert!(spent(&stx, &w.dfabi, 0x10));
++            }
++            let stx = block.transaction();
++            assert!(!spent(&stx, &w.dfabi, 0x10), "delivery leg must not survive the rejected DvP");
++            assert!(!used(&stx, &T1));
++        });
++    }
++
++    #[test]
++    fn rd_dvp_award_happy_path_and_single_use() {
++        world(|block, w| {
++            let mut stx = block.transaction();
++            let ch = chain(&stx);
++            let aw = award(&ch, &w.bi, [5; 32], &w.a, &w.dfabi, 100);
++            let t = award_trade(&ch, T1, good_leg(&w.dfabi, 0x10), good_leg(&w.rd, 0x20), [&w.bi, &w.a], aw.clone());
++            assert_eq!(exec(&mut stx, &w.a, t), "ok");
++            assert!(spent(&stx, &w.dfabi, 0x10) && spent(&stx, &w.rd, 0x20));
++            // same award, new trade id and fresh notes
++            let t = award_trade(&ch, T2, good_leg(&w.dfabi, 0x30), good_leg(&w.rd, 0x40), [&w.bi, &w.a], aw);
++            has(&exec(&mut stx, &w.bi, t), "rd-dvp: award_id already used");
++            assert!(!spent(&stx, &w.dfabi, 0x30) && !used(&stx, &T2));
++        });
++    }
++
++    #[test]
++    fn rd_dvp_award_failures() {
++        world(|block, w| {
++            let mut stx = block.transaction();
++            let ch = chain(&stx);
++            let (d, p) = (|| good_leg(&w.dfabi, 0x10), || good_leg(&w.rd, 0x20));
++            let mut try_award = |aw: SignedAward, who: [&P; 2], sender: &P| {
++                exec(&mut stx, sender, award_trade(&ch, T1, d(), p(), who, aw))
++            };
++            // signed by someone other than the owner of domain rd
++            let r = try_award(award(&ch, &w.a, [5; 32], &w.a, &w.dfabi, 100), [&w.bi, &w.a], &w.a);
++            has(&r, "rd-dvp: invalid award signature of");
++            // award expired (height 2)
++            let r = try_award(award(&ch, &w.bi, [5; 32], &w.a, &w.dfabi, 1), [&w.bi, &w.a], &w.a);
++            has(&r, "rd-dvp: award expired");
++            // winner is not one of the signers
++            let r = try_award(award(&ch, &w.bi, [5; 32], &w.b, &w.dfabi, 100), [&w.bi, &w.a], &w.a);
++            has(&r, "rd-dvp: award winner is not one of the two signers");
++            // the other signer is not bi
++            let r = try_award(award(&ch, &w.bi, [5; 32], &w.a, &w.dfabi, 100), [&w.a, &w.b], &w.a);
++            has(&r, "rd-dvp: an award trade must be signed by the owner of domain `rd`");
++            // award for another instrument
++            let r = try_award(award(&ch, &w.bi, [5; 32], &w.a, &w.rd, 100), [&w.bi, &w.a], &w.a);
++            has(&r, "rd-dvp: award instrument is not the delivery asset");
++            // award fields changed after signing
++            let mut tampered = award(&ch, &w.bi, [5; 32], &w.a, &w.dfabi, 100);
++            tampered.quantity += 1;
++            let r = try_award(tampered, [&w.bi, &w.a], &w.a);
++            has(&r, "rd-dvp: invalid award signature of");
++            drop(try_award);
++            assert!(!spent(&stx, &w.dfabi, 0x10) && !used(&stx, &T1));
++        });
++    }
++
++    #[test]
++    fn rd_dvp_plain_zk_transfer_of_dfabi_stays_allowed() {
++        world(|block, w| {
++            let mut stx = block.transaction();
++            let leg = good_leg(&w.dfabi, 0x10);
++            // P1 has no rule against it...
++            crate::rd_p1::check(&stx, &w.a.id, &InstructionBox::from(leg.clone())).expect("P1 allows UC-05");
++            // ...and it runs through the Initial executor (P2 envelope + proof check) on its own.
++            let r = match Executor::Initial.execute_instruction(&mut stx, &w.a.id, InstructionBox::from(leg)) {
++                Ok(()) => "ok".to_owned(),
++                Err(e) => format!("{e:?}"),
++            };
++            assert_eq!(r, "ok");
++            assert!(spent(&stx, &w.dfabi, 0x10));
++        });
++    }
++}
+diff --git a/crates/iroha_core/src/smartcontracts/isi/mod.rs b/crates/iroha_core/src/smartcontracts/isi/mod.rs
+index 4adad228..061174e6 100644
+--- a/crates/iroha_core/src/smartcontracts/isi/mod.rs
++++ b/crates/iroha_core/src/smartcontracts/isi/mod.rs
+@@ -286,6 +286,7 @@ const INSTRUCTION_HANDLERS: &[InstructionHandler] = &[
+     dispatch_instruction::<zk::Shield>,
+     dispatch_instruction::<zk::ZkTransfer>,
+     dispatch_instruction::<zk::Unshield>,
++    dispatch_instruction::<zk::ConfidentialDvp>,
+     dispatch_instruction::<zk::CreateElection>,
+     dispatch_instruction::<zk::SubmitBallot>,
+     dispatch_instruction::<zk::FinalizeElection>,
+diff --git a/crates/iroha_core/src/state.rs b/crates/iroha_core/src/state.rs
+index 28d5be03..b68dab61 100644
+--- a/crates/iroha_core/src/state.rs
++++ b/crates/iroha_core/src/state.rs
+@@ -509,6 +509,7 @@ macro_rules! build_world_block {
+             repo_agreements: $state.repo_agreements.$method(),
+             settlement_ledgers: $state.settlement_ledgers.$method(),
+             offline_note_v2_replay_keys: $state.offline_note_v2_replay_keys.$method(),
++            rd_dvp_used: $state.rd_dvp_used.$method(),
+             public_lane_validators: $state.public_lane_validators.$method(),
+             public_lane_stake_shares: $state.public_lane_stake_shares.$method(),
+             public_lane_rewards: $state.public_lane_rewards.$method(),
+@@ -703,6 +704,7 @@ macro_rules! build_world_transaction {
+             repo_agreements: $state.repo_agreements.transaction(),
+             settlement_ledgers: $state.settlement_ledgers.transaction(),
+             offline_note_v2_replay_keys: $state.offline_note_v2_replay_keys.transaction(),
++            rd_dvp_used: $state.rd_dvp_used.transaction(),
+             public_lane_validators: $state.public_lane_validators.transaction(),
+             public_lane_stake_shares: $state.public_lane_stake_shares.transaction(),
+             public_lane_rewards: $state.public_lane_rewards.transaction(),
+@@ -1808,6 +1810,8 @@ pub struct World {
+     pub(crate) settlement_ledgers: Storage<SettlementId, SettlementLedger>,
+     /// Offline V2 replay keys used for issued notes, certificates, nullifiers, and audit tokens.
+     pub(crate) offline_note_v2_replay_keys: Storage<Hash, ()>,
++    /// RD fork patch P3: single-use `ConfidentialDvp` trade ids and award ids (tagged hashes).
++    pub(crate) rd_dvp_used: Storage<Hash, ()>,
+     /// Public-lane validators keyed by `(lane_id, validator account id)`.
+     #[norito(skip)]
+     pub(crate) public_lane_validators: Storage<(LaneId, AccountId), PublicLaneValidatorRecord>,
+@@ -2208,6 +2212,7 @@ pub struct WorldBlock<'world> {
+     pub(crate) settlement_ledgers: StorageBlock<'world, SettlementId, SettlementLedger>,
+     /// Offline V2 replay keys used for issued notes, certificates, nullifiers, and audit tokens.
+     pub(crate) offline_note_v2_replay_keys: StorageBlock<'world, Hash, ()>,
++    pub(crate) rd_dvp_used: StorageBlock<'world, Hash, ()>,
+     /// Public lane validator registry.
+     pub(crate) public_lane_validators:
+         StorageBlock<'world, (LaneId, AccountId), PublicLaneValidatorRecord>,
+@@ -2806,6 +2811,7 @@ pub struct WorldTransaction<'block, 'world> {
+         StorageTransaction<'block, 'world, SettlementId, SettlementLedger>,
+     /// Offline V2 replay keys used for issued notes, certificates, nullifiers, and audit tokens.
+     pub(crate) offline_note_v2_replay_keys: StorageTransaction<'block, 'world, Hash, ()>,
++    pub(crate) rd_dvp_used: StorageTransaction<'block, 'world, Hash, ()>,
+     pub(crate) public_lane_validators:
+         StorageTransaction<'block, 'world, (LaneId, AccountId), PublicLaneValidatorRecord>,
+     pub(crate) public_lane_stake_shares:
+@@ -3549,6 +3555,7 @@ pub struct WorldView<'world> {
+     pub(crate) settlement_ledgers: StorageView<'world, SettlementId, SettlementLedger>,
+     /// Offline V2 replay keys used for issued notes, certificates, nullifiers, and audit tokens.
+     pub(crate) offline_note_v2_replay_keys: StorageView<'world, Hash, ()>,
++    pub(crate) rd_dvp_used: StorageView<'world, Hash, ()>,
+     pub(crate) public_lane_validators:
+         StorageView<'world, (LaneId, AccountId), PublicLaneValidatorRecord>,
+     pub(crate) public_lane_stake_shares:
+@@ -11723,6 +11730,7 @@ impl World {
+             repo_agreements: self.repo_agreements.view(),
+             settlement_ledgers: self.settlement_ledgers.view(),
+             offline_note_v2_replay_keys: self.offline_note_v2_replay_keys.view(),
++            rd_dvp_used: self.rd_dvp_used.view(),
+             public_lane_validators: self.public_lane_validators.view(),
+             public_lane_stake_shares: self.public_lane_stake_shares.view(),
+             public_lane_rewards: self.public_lane_rewards.view(),
+@@ -12206,6 +12214,8 @@ pub trait WorldReadOnly {
+     fn settlement_ledgers(&self) -> &impl StorageReadOnly<SettlementId, SettlementLedger>;
+     /// Offline V2 replay keys (read-only).
+     fn offline_note_v2_replay_keys(&self) -> &impl StorageReadOnly<Hash, ()>;
++    /// RD fork patch P3: used `ConfidentialDvp` trade/award ids (read-only).
++    fn rd_dvp_used(&self) -> &impl StorageReadOnly<Hash, ()>;
+     /// Public lane validators keyed by `(lane_id, validator)` (read-only).
+     fn public_lane_validators(
+         &self,
+@@ -13342,6 +13352,9 @@ macro_rules! impl_world_ro {
+             fn offline_note_v2_replay_keys(&self) -> &impl StorageReadOnly<Hash, ()> {
+                 &self.offline_note_v2_replay_keys
+             }
++            fn rd_dvp_used(&self) -> &impl StorageReadOnly<Hash, ()> {
++                &self.rd_dvp_used
++            }
+             fn public_lane_validators(
+                 &self,
+             ) -> &impl StorageReadOnly<(LaneId, AccountId), PublicLaneValidatorRecord> {
+@@ -13781,6 +13794,7 @@ impl<'world> WorldBlock<'world> {
+             repo_agreements,
+             settlement_ledgers,
+             offline_note_v2_replay_keys,
++            rd_dvp_used,
+             public_lane_validators,
+             public_lane_stake_shares,
+             public_lane_rewards,
+@@ -13885,6 +13899,7 @@ impl<'world> WorldBlock<'world> {
+         repo_agreements.commit();
+         settlement_ledgers.commit();
+         offline_note_v2_replay_keys.commit();
++        rd_dvp_used.commit();
+         domain_committees.commit();
+         domain_endorsement_policies.commit();
+         domain_endorsements.commit();
+@@ -14917,6 +14932,7 @@ impl<'block, 'world> WorldTransaction<'block, 'world> {
+             replication_orders,
+             settlement_ledgers,
+             offline_note_v2_replay_keys,
++            rd_dvp_used,
+             public_lane_validators,
+             public_lane_stake_shares,
+             public_lane_rewards,
+@@ -15019,6 +15035,7 @@ impl<'block, 'world> WorldTransaction<'block, 'world> {
+         self.soradns_history_len.apply();
+         settlement_ledgers.apply();
+         offline_note_v2_replay_keys.apply();
++        rd_dvp_used.apply();
+         domain_committees.apply();
+         domain_endorsement_policies.apply();
+         domain_endorsements.apply();
+@@ -29136,6 +29153,7 @@ pub(crate) mod deserialize {
+         let settlement_ledgers = take_optional_default(&mut map, "settlement_ledgers")?;
+         let offline_note_v2_replay_keys =
+             take_optional_default(&mut map, "offline_note_v2_replay_keys")?;
++        let rd_dvp_used = take_optional_default(&mut map, "rd_dvp_used")?;
+         let lane_relay_emergency_validators =
+             take_optional_default(&mut map, "lane_relay_emergency_validators")?;
+         let manifest_aliases = take_optional_default(&mut map, "manifest_aliases")?;
+@@ -29281,6 +29299,7 @@ pub(crate) mod deserialize {
+             repo_agreements,
+             settlement_ledgers,
+             offline_note_v2_replay_keys,
++            rd_dvp_used,
+             domain_committees: Storage::default(),
+             domain_endorsement_policies: Storage::default(),
+             domain_endorsements: Storage::default(),
+diff --git a/crates/iroha_data_model/src/isi/mod.rs b/crates/iroha_data_model/src/isi/mod.rs
+index c7340547..0283a82b 100644
+--- a/crates/iroha_data_model/src/isi/mod.rs
++++ b/crates/iroha_data_model/src/isi/mod.rs
+@@ -255,6 +255,11 @@ impl From<crate::isi::zk::ZkTransfer> for InstructionBox {
+         InstructionBox(Box::new(i))
+     }
+ }
++impl From<crate::isi::zk::ConfidentialDvp> for InstructionBox {
++    fn from(i: crate::isi::zk::ConfidentialDvp) -> Self {
++        InstructionBox(Box::new(i))
++    }
++}
+ impl From<crate::isi::zk::Unshield> for InstructionBox {
+     fn from(i: crate::isi::zk::Unshield) -> Self {
+         InstructionBox(Box::new(i))
+diff --git a/crates/iroha_data_model/src/isi/registry.rs b/crates/iroha_data_model/src/isi/registry.rs
+index d38f799c..266a19e3 100644
+--- a/crates/iroha_data_model/src/isi/registry.rs
++++ b/crates/iroha_data_model/src/isi/registry.rs
+@@ -253,6 +253,7 @@ const ALL_REGISTRARS: &[Registrar] = &[
+     InstructionRegistry::register::<zk::Shield>,
+     InstructionRegistry::register::<zk::ZkTransfer>,
+     InstructionRegistry::register::<zk::Unshield>,
++    InstructionRegistry::register::<zk::ConfidentialDvp>,
+     InstructionRegistry::register::<zk::CreateElection>,
+     InstructionRegistry::register::<zk::SubmitBallot>,
+     InstructionRegistry::register::<zk::FinalizeElection>,
+diff --git a/crates/iroha_data_model/src/isi/zk.rs b/crates/iroha_data_model/src/isi/zk.rs
+index 6c230a28..02d7d9e5 100644
+--- a/crates/iroha_data_model/src/isi/zk.rs
++++ b/crates/iroha_data_model/src/isi/zk.rs
+@@ -442,3 +442,115 @@ isi! {
+ }
+ 
+ impl crate::seal::Instruction for FinalizeElection {}
++
++/// Kind of a [`ConfidentialDvp`].
++#[derive(
++    Debug,
++    Clone,
++    Copy,
++    PartialEq,
++    Eq,
++    PartialOrd,
++    Ord,
++    norito::codec::Decode,
++    norito::codec::Encode,
++    iroha_schema::IntoSchema,
++)]
++pub enum DvpKind {
++    /// UC-03: BI awards a DFABI instrument to the winning bank; needs a [`SignedAward`].
++    Award,
++    /// UC-06: interbank DvP; no award.
++    Interbank,
++}
++
++/// One party's consent to a settlement tuple (RD fork patch P3).
++///
++/// `signature` is the signer's account-key signature over the 32-byte settlement digest
++/// (encoding documented on `iroha_core::rd_dvp::settlement_digest`).
++#[derive(
++    Debug,
++    Clone,
++    PartialEq,
++    Eq,
++    PartialOrd,
++    Ord,
++    norito::codec::Decode,
++    norito::codec::Encode,
++    iroha_schema::IntoSchema,
++)]
++pub struct DvpIntent {
++    /// Signing account (a single-key account).
++    pub signer: AccountId,
++    /// Signature over the settlement digest.
++    pub signature: iroha_crypto::Signature,
++}
++
++/// Award record of UC-03, signed by the owner of domain `rd` (encoding on
++/// `iroha_core::rd_dvp::award_digest`).
++#[derive(
++    Debug,
++    Clone,
++    PartialEq,
++    Eq,
++    PartialOrd,
++    Ord,
++    norito::codec::Decode,
++    norito::codec::Encode,
++    iroha_schema::IntoSchema,
++)]
++pub struct SignedAward {
++    /// Single-use award identifier.
++    pub award_id: [u8; 32],
++    /// Winning bank; must be one of the two trade signers.
++    pub winner: AccountId,
++    /// Awarded instrument; must be the delivery asset.
++    pub instrument: AssetDefinitionId,
++    /// Awarded quantity (not checkable against the hidden leg amounts).
++    pub quantity: u128,
++    /// Consideration in RD (not checkable against the hidden leg amounts).
++    pub consideration: u128,
++    /// Last block height at which the award is valid.
++    pub expiry_height: u64,
++    /// Signature of the owner of domain `rd` over the award digest.
++    pub bi_signature: iroha_crypto::Signature,
++}
++
++isi! {
++    /// Atomic confidential DvP: a DFABI `ZkTransfer` leg and an RD `ZkTransfer` leg executed together
++    /// or not at all, bound by two signed intents over one tuple (RD fork patch P3).
++    ///
++    /// Checked and executed by `iroha_core::rd_dvp`. All errors start with `rd-dvp:`.
++    pub struct ConfidentialDvp {
++        /// Single-use trade identifier.
++        pub trade_id: [u8; 32],
++        /// DFABI leg (delivery).
++        pub delivery: ZkTransfer,
++        /// RD leg (payment).
++        pub payment: ZkTransfer,
++        /// Last block height at which the trade may settle.
++        pub expiry_height: u64,
++        /// Consent of both parties (different signers; one of them is the tx authority).
++        pub intents: [DvpIntent; 2],
++        /// Award or interbank.
++        pub kind: DvpKind,
++        /// Required for [`DvpKind::Award`], forbidden for [`DvpKind::Interbank`].
++        pub award: Option<SignedAward>,
++    }
++}
++
++impl crate::seal::Instruction for ConfidentialDvp {}
++
++impl ConfidentialDvp {
++    /// Construct a new `ConfidentialDvp` instruction.
++    pub fn new(
++        trade_id: [u8; 32],
++        delivery: ZkTransfer,
++        payment: ZkTransfer,
++        expiry_height: u64,
++        intents: [DvpIntent; 2],
++        kind: DvpKind,
++        award: Option<SignedAward>,
++    ) -> Self {
++        Self { trade_id, delivery, payment, expiry_height, intents, kind, award }
++    }
++}
+-- 
+2.43.0
+
